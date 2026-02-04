@@ -70,6 +70,9 @@ class Benchmark(ABC):
     def get_test_set(self):
         return self.test_set
 
+    def get_val_set(self):
+        return self.val_set
+
 
 @dataclass
 class BenchmarkMeta:

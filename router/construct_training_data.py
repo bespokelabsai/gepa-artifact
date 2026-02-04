@@ -14,12 +14,63 @@ from typing import Dict, List, Set
 import random
 from datasets import load_dataset
 import tqdm
+import importlib
 
 # Add gepa_artifact to path for loading pickle files
 root_dir = Path(__file__).parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
+
+def extract_benchmark_name(experiment_dir: str) -> str:
+    """
+    Extract benchmark name from experiment directory path.
+
+    Experiment directories follow the pattern: {BenchmarkName}_{Program}_{Algorithm}_{Model}
+    For example: 'hoverBench_HoverMultiHop_GEPA_Qwen3-8B' -> 'hoverBench'
+    """
+    dir_name = os.path.basename(experiment_dir)
+    # Split by underscore and take the first part
+    benchmark_name = dir_name.split('_')[0]
+    return benchmark_name
+
+
+def load_benchmark_dspy_dataset(benchmark_name: str = "hoverBench", seed: int = 0) -> List[Dict]:
+    """
+    Dynamically load the appropriate benchmark dataset based on the benchmark name.
+
+    Args:
+        benchmark_name: Name of the benchmark (e.g., 'hoverBench', 'HotpotQABench', 'IFBench')
+        seed: Random seed for dataset shuffling
+
+    Returns:
+        List of dictionaries containing the validation set data
+    """
+    # Mapping of benchmark names to their module paths
+    benchmark_modules = {
+        'hoverBench': 'gepa_artifact.benchmarks.hover.hover_data',
+        'HotpotQABench': 'gepa_artifact.benchmarks.hotpotQA.hotpot_data',
+        'IFBench': 'gepa_artifact.benchmarks.IFBench.ifbench_data',
+        'AIMEBench': 'gepa_artifact.benchmarks.AIME.AIME_data',
+        'Papillon': 'gepa_artifact.benchmarks.papillon.papillon_data',
+    }
+
+    # Default to hover if benchmark not recognized
+    if benchmark_name not in benchmark_modules:
+        print(f"Warning: Benchmark '{benchmark_name}' not recognized. Defaulting to 'hoverBench'")
+        benchmark_name = 'hoverBench'
+
+    module_path = benchmark_modules[benchmark_name]
+
+    # Dynamically import the benchmark module
+    module = importlib.import_module(module_path)
+    benchmark_class = getattr(module, benchmark_name)
+
+    # Instantiate the benchmark (this will load and prepare the dataset)
+    benchmark_instance = benchmark_class(dataset_mode="lite")
+
+    # Get the validation set
+    return benchmark_instance.get_val_set()
 
 def count_unique_docs(example):
     """Count unique documents in supporting facts (from hover_utils.py)"""
@@ -90,7 +141,6 @@ def load_system_prompts(prog_candidates_dir: str, num_candidates: int) -> Dict[i
                 # Load the actual program to get prompt text
                 with open(prog_path, 'rb') as f:
                     program = pickle.load(f)
-
                 prompt_text = str(program)
 
                 metadata = {
@@ -155,7 +205,7 @@ def construct_training_data(
     experiment_dir: str,
     output_file: str,
     seed: int = 0,
-    strategy: str = "all_candidates"
+    benchmark_name: str = None
 ):
     """
     Construct training dataset for prompt router.
@@ -168,6 +218,8 @@ def construct_training_data(
                  - "all_candidates": Include all (task, candidate, reward) tuples
                  - "pareto_only": Only include candidates in pareto frontier for each task
                  - "best_from_pareto": One example per task with best candidate (legacy)
+        benchmark_name: Name of the benchmark to use. If None, will be extracted from experiment_dir.
+                       Defaults to 'hoverBench' if not found.
     """
     print(f"Loading GEPA state from {experiment_dir}...")
     state_path = os.path.join(experiment_dir, "gepa_state.bin")
@@ -181,9 +233,18 @@ def construct_training_data(
 
     print(f"Found {num_candidates} candidates and {num_tasks} tasks")
 
-    # Load the validation set
-    print("Loading HoVer validation set...")
-    valset = load_hover_valset(seed=seed)
+    # Determine which benchmark to use
+    if benchmark_name is None:
+        benchmark_name = extract_benchmark_name(experiment_dir)
+        print(f"Detected benchmark: {benchmark_name}")
+    else:
+        print(f"Using specified benchmark: {benchmark_name}")
+
+    # Load the validation set for the appropriate benchmark
+    print(f"Loading {benchmark_name} validation set...")
+    
+    valset = load_benchmark_dspy_dataset(benchmark_name=benchmark_name, seed=seed)
+    
 
     if len(valset) != num_tasks:
         print(f"Warning: Valset size ({len(valset)}) doesn't match number of tasks ({num_tasks})")
@@ -206,86 +267,35 @@ def construct_training_data(
     for task_idx in tqdm.tqdm(range(num_tasks)):
         task = valset[task_idx]
         pareto_frontier = pareto_frontiers[task_idx]
+        # Create one example for each (task, candidate) pair
+        for candidate_idx in range(num_candidates):
+            # Skip if prompt wasn't loaded successfully
+            if candidate_idx not in system_prompts or not system_prompts[candidate_idx].get('exists', False):
+                continue
+            if 'prompt' not in system_prompts[candidate_idx]:
+                continue
 
-        if strategy == "all_candidates":
-            # Create one example for each (task, candidate) pair
-            for candidate_idx in range(num_candidates):
-                # Skip if prompt wasn't loaded successfully
-                if candidate_idx not in system_prompts or not system_prompts[candidate_idx].get('exists', False):
-                    continue
-                if 'prompt' not in system_prompts[candidate_idx]:
-                    continue
+            import pdb; pdb.set_trace()
+            reward = prog_candidate_val_subscores[candidate_idx][task_idx]
+            # Convert boolean to float
+            if isinstance(reward, bool):
+                reward = float(reward)
+            elif reward == 0:
+                reward = 0.0
+            else:
+                reward = float(reward)
 
-                reward = prog_candidate_val_subscores[candidate_idx][task_idx]
-                # Convert boolean to float
-                if isinstance(reward, bool):
-                    reward = float(reward)
-                elif reward == 0:
-                    reward = 0.0
-                else:
-                    reward = float(reward)
-
-                training_example = {
-                    "task_idx": task_idx,
-                    "claim": task["claim"],
-                    "label": task["label"],
-                    "supporting_facts": task["supporting_facts"],
-                    "candidate_idx": candidate_idx,
-                    "candidate_prompt": system_prompts[candidate_idx]["prompt"],
-                    "reward": reward,
-                    "in_pareto_frontier": candidate_idx in pareto_frontier,
-                }
-                training_data.append(training_example)
-
-        elif strategy == "pareto_only":
-            # Only include candidates in pareto frontier
-            for candidate_idx in pareto_frontier:
-                # Skip if prompt wasn't loaded successfully
-                if candidate_idx not in system_prompts or not system_prompts[candidate_idx].get('exists', False):
-                    continue
-                if 'prompt' not in system_prompts[candidate_idx]:
-                    continue
-
-                reward = prog_candidate_val_subscores[candidate_idx][task_idx]
-                if isinstance(reward, bool):
-                    reward = float(reward)
-                elif reward == 0:
-                    reward = 0.0
-                else:
-                    reward = float(reward)
-
-                training_example = {
-                    "task_idx": task_idx,
-                    "claim": task["claim"],
-                    "label": task["label"],
-                    "supporting_facts": task["supporting_facts"],
-                    "candidate_idx": candidate_idx,
-                    "candidate_prompt": system_prompts[candidate_idx]["prompt"],
-                    "reward": reward,
-                    "in_pareto_frontier": True,
-                }
-                training_data.append(training_example)
-
-        elif strategy == "best_from_pareto":
-            # Legacy: Select single best candidate from pareto frontier
-            best_candidate_idx = select_best_candidate_for_task(
-                task_idx, pareto_frontier, prog_candidate_val_subscores
-            )
-
+            # Create training example with all task fields
             training_example = {
                 "task_idx": task_idx,
-                "claim": task["claim"],
-                "label": task["label"],
-                "supporting_facts": task["supporting_facts"],
-                "pareto_frontier": sorted(list(pareto_frontier)),
-                "selected_candidate": best_candidate_idx,
-                "selected_candidate_score": prog_candidate_val_subscores[best_candidate_idx][task_idx],
-                "all_candidate_scores": {
-                    cand_idx: prog_candidate_val_subscores[cand_idx][task_idx]
-                    for cand_idx in pareto_frontier
-                }
+                **task,  # Include all fields from the task
+                "candidate_idx": candidate_idx,
+                "candidate_system_prompt": system_prompts[candidate_idx]["prompt"],
+                "reward": reward,
+                "in_pareto_frontier": candidate_idx in pareto_frontier,
             }
             training_data.append(training_example)
+
 
     # Save training data
     print(f"Saving {len(training_data)} training examples to {output_file}...")
@@ -305,40 +315,25 @@ def construct_training_data(
         json.dump(metadata_only, f, indent=2)
 
     # Compute summary statistics
-    if strategy in ["all_candidates", "pareto_only"]:
-        # Compute reward statistics
-        rewards = [ex["reward"] for ex in training_data]
-        reward_mean = sum(rewards) / len(rewards) if rewards else 0
-        reward_positive = sum(1 for r in rewards if r > 0) / len(rewards) if rewards else 0
+    rewards = [ex["reward"] for ex in training_data]
+    reward_mean = sum(rewards) / len(rewards) if rewards else 0
+    reward_positive = sum(1 for r in rewards if r > 0) / len(rewards) if rewards else 0
 
-        summary = {
-            "num_tasks": num_tasks,
-            "num_candidates": num_candidates,
-            "num_training_examples": len(training_data),
-            "strategy": strategy,
-            "seed": seed,
-            "experiment_dir": experiment_dir,
-            "reward_statistics": {
-                "mean": reward_mean,
-                "positive_ratio": reward_positive,
-                "total_positive": sum(1 for r in rewards if r > 0),
-                "total_negative": sum(1 for r in rewards if r == 0),
-            },
-            "examples_per_task": len(training_data) / num_tasks if num_tasks > 0 else 0,
-        }
-    else:
-        summary = {
-            "num_tasks": num_tasks,
-            "num_candidates": num_candidates,
-            "num_training_examples": len(training_data),
-            "strategy": strategy,
-            "seed": seed,
-            "experiment_dir": experiment_dir,
-            "pareto_frontier_sizes": {
-                task_idx: len(pareto_frontiers[task_idx])
-                for task_idx in range(min(10, num_tasks))  # First 10 as example
-            }
-        }
+    summary = {
+        "num_tasks": num_tasks,
+        "num_candidates": num_candidates,
+        "num_training_examples": len(training_data),
+        "seed": seed,
+        "benchmark_name": benchmark_name,
+        "experiment_dir": experiment_dir,
+        "reward_statistics": {
+            "mean": reward_mean,
+            "positive_ratio": reward_positive,
+            "total_positive": sum(1 for r in rewards if r > 0),
+            "total_negative": sum(1 for r in rewards if r == 0),
+        },
+        "examples_per_task": len(training_data) / num_tasks if num_tasks > 0 else 0,
+    }
 
     summary_file = output_path.parent / "dataset_summary.json"
     with open(summary_file, 'w') as f:
@@ -353,12 +348,10 @@ def construct_training_data(
     print(f"  Total candidates: {num_candidates}")
     print(f"  Training examples: {len(training_data)}")
 
-    if strategy in ["all_candidates", "pareto_only"]:
-        print(f"  Examples per task: {len(training_data) / num_tasks:.1f}")
-        print(f"  Mean reward: {summary['reward_statistics']['mean']:.4f}")
-        print(f"  Positive ratio: {summary['reward_statistics']['positive_ratio']:.4f}")
-    else:
-        print(f"  Average pareto frontier size: {sum(len(pf) for pf in pareto_frontiers[:num_tasks]) / num_tasks:.2f}")
+    # if strategy in ["all_candidates", "pareto_only"]:
+    print(f"  Examples per task: {len(training_data) / num_tasks:.1f}")
+    print(f"  Mean reward: {summary['reward_statistics']['mean']:.4f}")
+    print(f"  Positive ratio: {summary['reward_statistics']['positive_ratio']:.4f}")
 
 
 if __name__ == "__main__":
@@ -383,15 +376,13 @@ if __name__ == "__main__":
         default=0,
         help="Random seed for dataset shuffling"
     )
+
     parser.add_argument(
-        "--strategy",
+        "--benchmark_name",
         type=str,
-        choices=["all_candidates", "pareto_only", "best_from_pareto"],
-        default="all_candidates",
-        help="Strategy for creating training examples: "
-             "all_candidates (all task-candidate pairs), "
-             "pareto_only (only pareto frontier candidates), "
-             "best_from_pareto (legacy, one per task)"
+        default=None,
+        help="Name of the benchmark to use (e.g., 'hoverBench', 'HotpotQABench', 'IFBench'). "
+             "If not specified, will be auto-detected from experiment_dir. Defaults to 'hoverBench'."
     )
 
     args = parser.parse_args()
@@ -400,5 +391,5 @@ if __name__ == "__main__":
         experiment_dir=args.experiment_dir,
         output_file=args.output_file,
         seed=args.seed,
-        strategy=args.strategy
+        benchmark_name=args.benchmark_name
     )
