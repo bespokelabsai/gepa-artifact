@@ -116,6 +116,7 @@ def run_experiment_and_write_results_actual(
             # Now, we will wait indefinitely till the source run has evaluation results ready
             print(f"Waiting for {cache_source_run_dir} to have evaluation results ready...")
             while not os.path.exists(os.path.join(cache_source_run_dir, "evaluation_results")):
+                print("needs to create ", os.path.join(cache_source_run_dir, "evaluation_results"))
                 time.sleep(100)
             print(f"Found evaluation results for {cache_source_run_name} in {cache_source_run_dir}.")
             print(f"Copying cache from {cache_source_cache_dir} to {cache_dir}...")
