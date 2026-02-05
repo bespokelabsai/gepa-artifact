@@ -8,6 +8,7 @@ is best suited for a given task.
 import dspy
 from typing import List, Dict, Union
 import re
+import asyncio
 from router_base import Router
 
 
@@ -17,7 +18,7 @@ class CandidateSelection(dspy.Signature):
     """
 
     task_input = dspy.InputField(desc="The input task (e.g., question, claim, problem)")
-    candidates_info = dspy.InputField(desc="Information about candidate system prompts with their indices")
+    candidates: list[str] = dspy.InputField(desc="List of candidate system prompts")
     selected_candidate_idx = dspy.OutputField(desc="The index of the best candidate (just the number)")
 
 
@@ -27,7 +28,7 @@ class CandidateSelectionWithReasoning(dspy.Signature):
     """
 
     task_input = dspy.InputField(desc="The input task (e.g., question, claim, problem)")
-    candidates_info = dspy.InputField(desc="Information about candidate system prompts with their indices")
+    candidates: list[str] = dspy.InputField(desc="List of candidate system prompts")
     reasoning = dspy.OutputField(desc="Step-by-step reasoning about which candidate is best")
     selected_candidate_idx = dspy.OutputField(desc="The index of the best candidate (just the number)")
 
@@ -44,10 +45,7 @@ class QwenRouter(Router):
         self,
         lm: dspy.LM = None,
         benchmark_name: str = "hoverBench",
-        use_reasoning: bool = True,
-        max_candidates_display: int = 10,
-        summarize_prompts: bool = True,
-        max_prompt_length: int = 200
+        use_reasoning: bool = False
     ):
         """
         Initialize the Qwen Router.
@@ -56,17 +54,12 @@ class QwenRouter(Router):
             lm: DSPy language model. If None, uses the currently configured default LM.
             benchmark_name: Name of the benchmark
             use_reasoning: If True, use chain-of-thought reasoning
-            max_candidates_display: Maximum number of candidates to show in full detail
-            summarize_prompts: If True, truncate long prompts for efficiency
-            max_prompt_length: Maximum length of each prompt to show
         """
         super().__init__(benchmark_name)
+        assert lm is not None, "LM must be provided"
 
         self.lm = lm
         self.use_reasoning = use_reasoning
-        self.max_candidates_display = max_candidates_display
-        self.summarize_prompts = summarize_prompts
-        self.max_prompt_length = max_prompt_length
 
         # Initialize the DSPy module
         if use_reasoning:
@@ -74,44 +67,20 @@ class QwenRouter(Router):
         else:
             self.predictor = dspy.Predict(CandidateSelection)
 
-        # Set the LM if provided
-        if lm is not None:
-            with dspy.context(lm=lm):
-                pass
+        self.predictor.set_lm(lm)
 
-    def _format_candidates(self, candidates: List[Dict]) -> str:
+    def _format_candidates(self, candidates: List[Dict]) -> List[str]:
         """
-        Format candidates into a readable string for the LM.
+        Format candidates into a list for the LM.
 
         Args:
             candidates: List of candidate dicts
 
         Returns:
-            Formatted string describing all candidates
+            List of candidate system prompts
         """
-        formatted_lines = []
-
-        # Limit number of candidates shown in detail
-        num_to_show = min(len(candidates), self.max_candidates_display)
-
-        for i, candidate in enumerate(candidates[:num_to_show]):
-            prompt = candidate['candidate_system_prompt']
-
-            # Optionally truncate long prompts
-            if self.summarize_prompts and len(prompt) > self.max_prompt_length:
-                prompt = prompt[:self.max_prompt_length] + "..."
-
-            formatted_lines.append(
-                f"Candidate {candidate['candidate_idx']}:\n{prompt}\n"
-            )
-
-        if len(candidates) > num_to_show:
-            formatted_lines.append(
-                f"\n... and {len(candidates) - num_to_show} more candidates (indices: "
-                f"{', '.join(str(c['candidate_idx']) for c in candidates[num_to_show:])})"
-            )
-
-        return "\n".join(formatted_lines)
+        # Return list of system prompts
+        return [candidate['candidate_system_prompt'] for candidate in candidates]
 
     def _parse_selection(self, output: str, candidates: List[Dict]) -> int:
         """
@@ -171,22 +140,15 @@ class QwenRouter(Router):
             raise ValueError("Cannot select from empty candidate list")
 
         # Format candidates for the LM
-        candidates_info = self._format_candidates(candidates)
+        candidates_list = self._format_candidates(candidates)
 
         # Call the LM
         try:
-            if self.lm is not None:
-                with dspy.context(lm=self.lm):
-                    prediction = self.predictor(
-                        task_input=task_input,
-                        candidates_info=candidates_info
-                    )
-            else:
-                prediction = self.predictor(
-                    task_input=task_input,
-                    candidates_info=candidates_info
-                )
-
+            prediction = self.predictor(
+                task_input=task_input,
+                candidates=candidates_list
+            )
+            print("!!!!", prediction)
             # Parse the selection
             selected_idx = self._parse_selection(
                 prediction.selected_candidate_idx,
@@ -206,6 +168,30 @@ class QwenRouter(Router):
             return selected_idx, scores
 
         return selected_idx
+
+    async def select_candidate_async(
+        self,
+        task_input: str,
+        candidates: List[Dict],
+        return_scores: bool = False
+    ) -> Union[int, tuple]:
+        """
+        Async version: Use the LM to select the best candidate for a given task.
+
+        Args:
+            task_input: The input text for the task
+            candidates: List of candidate dicts
+            return_scores: If True, return scores
+
+        Returns:
+            candidate_idx or (candidate_idx, scores_dict)
+        """
+        # Run the synchronous call in an executor to avoid blocking
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.select_candidate(task_input, candidates, return_scores)
+        )
 
     def batch_select_candidates(
         self,
@@ -242,6 +228,45 @@ class QwenRouter(Router):
         if return_scores:
             return selected_indices, all_scores
         return selected_indices
+
+    async def batch_select_candidates_async(
+        self,
+        task_inputs: List[str],
+        candidates_list: List[List[Dict]],
+        return_scores: bool = False,
+        max_concurrent: int = 10
+    ) -> Union[List[int], tuple]:
+        """
+        Async version: Select candidates for multiple tasks in parallel.
+
+        Args:
+            task_inputs: List of input texts
+            candidates_list: List of candidate lists
+            return_scores: If True, return scores
+            max_concurrent: Maximum number of concurrent API calls
+
+        Returns:
+            List of selected candidate indices or (indices, scores)
+        """
+        # Use semaphore to limit concurrent requests
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def select_with_semaphore(task_input, candidates):
+            async with semaphore:
+                return await self.select_candidate_async(task_input, candidates, return_scores)
+
+        # Run all selections concurrently
+        results = await asyncio.gather(*[
+            select_with_semaphore(task_input, candidates)
+            for task_input, candidates in zip(task_inputs, candidates_list)
+        ])
+
+        if return_scores:
+            selected_indices = [r[0] for r in results]
+            all_scores = [r[1] for r in results]
+            return selected_indices, all_scores
+        else:
+            return results
 
     def get_name(self) -> str:
         """Get the name of this router."""

@@ -11,8 +11,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
 from tqdm import tqdm
+import asyncio
 
 from router_base import Router, RandomRouter, OracleRouter
+from qwen_router import QwenRouter
+import dspy
 
 
 class RouterEvaluator:
@@ -182,7 +185,7 @@ class RouterEvaluator:
 
             for k in top_k:
                 if k <= len(sorted_candidates):
-                    top_k_indices = [idx for idx, score in sorted_candidates[:k]]
+                    top_k_indices = [idx for idx, _ in sorted_candidates[:k]]
                     if any(idx in best_candidate_indices for idx in top_k_indices):
                         top_k_correct[k] += 1
 
@@ -198,6 +201,171 @@ class RouterEvaluator:
                 'is_in_pareto': is_in_pareto,
                 'num_candidates': len(candidates),
             })
+
+        # Compute final metrics
+        metrics = {
+            'router_name': router.get_name(),
+            'total_tasks': total_tasks,
+            'avg_selected_reward': np.mean(selected_rewards) if selected_rewards else 0,
+            'avg_best_reward': np.mean(best_rewards) if best_rewards else 0,
+            'reward_gap': np.mean(best_rewards) - np.mean(selected_rewards) if selected_rewards else 0,
+            'pareto_selection_rate': pareto_selections / total_tasks if total_tasks > 0 else 0,
+        }
+
+        # Add top-k accuracies
+        for k in top_k:
+            metrics[f'top_{k}_accuracy'] = top_k_correct[k] / total_tasks if total_tasks > 0 else 0
+
+        # Compute regret (normalized reward gap)
+        if best_rewards:
+            metrics['normalized_regret'] = metrics['reward_gap'] / np.mean(best_rewards) if np.mean(best_rewards) > 0 else 0
+
+        # Add data statistics
+        metrics['data_stats'] = self.stats
+
+        if verbose:
+            self._print_metrics(metrics)
+
+        return {
+            'metrics': metrics,
+            'task_results': task_results,
+        }
+
+    async def evaluate_async(
+        self,
+        router: Router,
+        top_k: List[int] = [1, 3, 5],
+        verbose: bool = True,
+        batch_size: int = 50,
+        max_concurrent: int = 10
+    ) -> Dict:
+        """
+        Async version: Evaluate a router on the dataset with parallel processing.
+
+        This is much faster for LM-based routers like QwenRouter that make API calls.
+
+        Args:
+            router: The router to evaluate
+            top_k: List of k values for top-k accuracy computation
+            verbose: Whether to print progress
+            batch_size: Number of tasks to process in each batch
+            max_concurrent: Maximum concurrent API calls
+
+        Returns:
+            Dict containing evaluation metrics
+        """
+        if verbose:
+            print(f"\nEvaluating router (ASYNC): {router.get_name()}")
+            print(f"Batch size: {batch_size}, Max concurrent: {max_concurrent}")
+            print("="*80)
+
+        # Check if router supports async
+        if not hasattr(router, 'batch_select_candidates_async'):
+            if verbose:
+                print("Router doesn't support async, falling back to sync evaluation")
+            return self.evaluate(router, top_k, verbose)
+
+        # Metrics
+        selected_rewards = []
+        best_rewards = []
+        top_k_correct = {k: 0 for k in top_k}
+        pareto_selections = 0
+        total_tasks = 0
+
+        # Per-task results
+        task_results = []
+
+        # Filter valid tasks
+        valid_tasks = [task for task in self.data if task['candidates']]
+
+        # Create batches
+        batches = [valid_tasks[i:i + batch_size] for i in range(0, len(valid_tasks), batch_size)]
+
+        if verbose:
+            print(f"Processing {len(valid_tasks)} tasks in {len(batches)} batches...")
+
+        # Process each batch
+        for batch_idx, batch in enumerate(batches):
+            if verbose:
+                print(f"Processing batch {batch_idx + 1}/{len(batches)}...")
+
+            # Extract inputs and candidates for the batch
+            batch_task_inputs = [router.extract_task_input(task) for task in batch]
+            batch_candidates = [task['candidates'] for task in batch]
+
+            # Get router's selections with scores using async batch processing
+            selected_indices, all_scores = await router.batch_select_candidates_async(
+                batch_task_inputs,
+                batch_candidates,
+                return_scores=True,
+                max_concurrent=max_concurrent
+            )
+
+            # Process each task in the batch
+            for task, selected_idx, scores in zip(batch, selected_indices, all_scores):
+                task_idx = task['task_idx']
+                candidates = task['candidates']
+
+                # Find the selected candidate's reward
+                selected_reward = None
+                is_in_pareto = False
+                for candidate in candidates:
+                    if candidate['candidate_idx'] == selected_idx:
+                        selected_reward = candidate['reward']
+                        is_in_pareto = candidate.get('in_pareto_frontier', False)
+                        break
+
+                if selected_reward is None:
+                    print(f"Warning: Selected candidate {selected_idx} not found in task {task_idx}")
+                    continue
+
+                # Find best reward for this task
+                rewards = [c['reward'] for c in candidates]
+                best_reward = max(rewards)
+
+                # Track metrics
+                selected_rewards.append(selected_reward)
+                best_rewards.append(best_reward)
+
+                if is_in_pareto:
+                    pareto_selections += 1
+
+                # Check if selected candidate is optimal
+                is_optimal = (selected_reward == best_reward)
+                if is_optimal:
+                    top_k_correct[1] += 1  # Top-1 is correct
+
+                # Check top-k accuracy
+                # Sort candidates by router's scores
+                sorted_candidates = sorted(
+                    [(c['candidate_idx'], scores.get(c['candidate_idx'], 0)) for c in candidates],
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+
+                # Get candidates with best reward
+                best_candidate_indices = [
+                    c['candidate_idx'] for c in candidates if c['reward'] == best_reward
+                ]
+
+                for k in top_k:
+                    if k <= len(sorted_candidates):
+                        top_k_indices = [idx for idx, _ in sorted_candidates[:k]]
+                        if any(idx in best_candidate_indices for idx in top_k_indices):
+                            top_k_correct[k] += 1
+
+                total_tasks += 1
+
+                # Store per-task result
+                task_results.append({
+                    'task_idx': task_idx,
+                    'selected_candidate': selected_idx,
+                    'selected_reward': selected_reward,
+                    'best_reward': best_reward,
+                    'is_optimal': is_optimal,
+                    'is_in_pareto': is_in_pareto,
+                    'num_candidates': len(candidates),
+                })
 
         # Compute final metrics
         metrics = {
@@ -327,9 +495,9 @@ def main():
     parser.add_argument(
         '--router',
         type=str,
-        choices=['random', 'oracle', 'all'],
+        choices=['random', 'oracle', 'qwen', 'all'],
         default='random',
-        help='Which router to evaluate: random, oracle, or all'
+        help='Which router to evaluate: random, oracle, qwen, or all'
     )
     parser.add_argument(
         '--seed',
@@ -349,6 +517,23 @@ def main():
         nargs='+',
         default=[1, 3, 5],
         help='Values of k for top-k accuracy (default: 1 3 5)'
+    )
+    parser.add_argument(
+        '--use_async',
+        action='store_true',
+        help='Use async evaluation for faster processing (recommended for Qwen router)'
+    )
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=50,
+        help='Batch size for async evaluation (default: 50)'
+    )
+    parser.add_argument(
+        '--max_concurrent',
+        type=int,
+        default=10,
+        help='Maximum concurrent API calls for async evaluation (default: 10)'
     )
 
     args = parser.parse_args()
@@ -372,9 +557,24 @@ def main():
             benchmark_name=evaluator.benchmark_name
         ))
 
+    if args.router == 'qwen' or args.router == 'all':
+        routers.append(QwenRouter(
+            lm=dspy.LM('openai/Qwen/Qwen3-4B-Instruct-2507', api_key='nothing', api_base='http://localhost:8000/v1/', cache=True),
+            benchmark_name=evaluator.benchmark_name
+        ))
+
     # Evaluate
     if len(routers) == 1:
-        result = evaluator.evaluate(routers[0], top_k=args.top_k)
+        # Use async evaluation if requested
+        if args.use_async:
+            result = asyncio.run(evaluator.evaluate_async(
+                routers[0],
+                top_k=args.top_k,
+                batch_size=args.batch_size,
+                max_concurrent=args.max_concurrent
+            ))
+        else:
+            result = evaluator.evaluate(routers[0], top_k=args.top_k)
 
         # Save results if output file specified
         if args.output_file:
