@@ -80,7 +80,8 @@ class QwenRouter(Router):
             List of candidate system prompts
         """
         # Return list of system prompts
-        return [candidate['candidate_system_prompt'] for candidate in candidates]
+        return [f"{idx}.\n{candidate['candidate_system_prompt']}" for idx, candidate in enumerate(candidates)]
+        
 
     def _parse_selection(self, output: str, candidates: List[Dict]) -> int:
         """

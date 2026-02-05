@@ -35,16 +35,17 @@ def extract_benchmark_name(experiment_dir: str) -> str:
     return benchmark_name
 
 
-def load_benchmark_dspy_dataset(benchmark_name: str = "hoverBench", seed: int = 0) -> List[Dict]:
+def load_benchmark_dspy_dataset(benchmark_name: str = "hoverBench", seed: int = 0, split: str = "val"):
     """
     Dynamically load the appropriate benchmark dataset based on the benchmark name.
 
     Args:
         benchmark_name: Name of the benchmark (e.g., 'hoverBench', 'HotpotQABench', 'IFBench')
         seed: Random seed for dataset shuffling
+        split: Which split to load ('train', 'val', or 'test')
 
     Returns:
-        List of dictionaries containing the validation set data
+        DSPy dataset for the specified split
     """
     # Mapping of benchmark names to their module paths
     benchmark_modules = {
@@ -69,8 +70,15 @@ def load_benchmark_dspy_dataset(benchmark_name: str = "hoverBench", seed: int = 
     # Instantiate the benchmark (this will load and prepare the dataset)
     benchmark_instance = benchmark_class(dataset_mode="lite")
 
-    # Get the validation set
-    return benchmark_instance.get_val_set()
+    # Get the appropriate split
+    if split == "train":
+        return benchmark_instance.get_train_set()
+    elif split == "val":
+        return benchmark_instance.get_val_set()
+    elif split == "test":
+        return benchmark_instance.get_test_set()
+    else:
+        raise ValueError(f"Invalid split: {split}. Must be 'train', 'val', or 'test'")
 
 def count_unique_docs(example):
     """Count unique documents in supporting facts (from hover_utils.py)"""
@@ -201,71 +209,38 @@ def select_best_candidate_for_task(
     return best_candidate
 
 
-def construct_training_data(
-    experiment_dir: str,
-    output_file: str,
-    seed: int = 0,
-    benchmark_name: str = None
-):
+def construct_dataset_split(
+    split_name: str,
+    dataset: List,
+    pareto_frontiers: List[Set[int]],
+    prog_candidate_subscores: List[List],
+    system_prompts: Dict[int, Dict],
+    num_candidates: int
+) -> List[Dict]:
     """
-    Construct training dataset for prompt router.
+    Helper function to construct dataset for a specific split (train or val).
 
     Args:
-        experiment_dir: Path to the experiment directory
-        output_file: Path to save the training data
-        seed: Random seed for dataset shuffling
-        strategy: Strategy for creating training examples
-                 - "all_candidates": Include all (task, candidate, reward) tuples
-                 - "pareto_only": Only include candidates in pareto frontier for each task
-                 - "best_from_pareto": One example per task with best candidate (legacy)
-        benchmark_name: Name of the benchmark to use. If None, will be extracted from experiment_dir.
-                       Defaults to 'hoverBench' if not found.
-    """
-    print(f"Loading GEPA state from {experiment_dir}...")
-    state_path = os.path.join(experiment_dir, "gepa_state.bin")
-    state = load_gepa_state(state_path)
+        split_name: Name of the split ('train' or 'val')
+        dataset: The dataset examples
+        pareto_frontiers: List of pareto frontiers (one per task)
+        prog_candidate_subscores: Candidate scores for this split
+        system_prompts: Dict of system prompts
+        num_candidates: Total number of candidates
 
-    # Extract relevant data from state
-    pareto_frontiers = state['program_at_pareto_front_valset']  # List of sets
-    prog_candidate_val_subscores = state['prog_candidate_val_subscores']  # List[List]
-    num_candidates = len(prog_candidate_val_subscores)
+    Returns:
+        List of training examples for this split
+    """
+    training_data = []
     num_tasks = len(pareto_frontiers)
 
-    print(f"Found {num_candidates} candidates and {num_tasks} tasks")
-
-    # Determine which benchmark to use
-    if benchmark_name is None:
-        benchmark_name = extract_benchmark_name(experiment_dir)
-        print(f"Detected benchmark: {benchmark_name}")
-    else:
-        print(f"Using specified benchmark: {benchmark_name}")
-
-    # Load the validation set for the appropriate benchmark
-    print(f"Loading {benchmark_name} validation set...")
-    
-    valset = load_benchmark_dspy_dataset(benchmark_name=benchmark_name, seed=seed)
-    
-
-    if len(valset) != num_tasks:
-        print(f"Warning: Valset size ({len(valset)}) doesn't match number of tasks ({num_tasks})")
-        print(f"Using first {min(len(valset), num_tasks)} tasks")
-        num_tasks = min(len(valset), num_tasks)
-
-    # Load system prompts (including actual prompt text)
-    print("Loading system prompt candidates...")
-    prog_candidates_dir = os.path.join(experiment_dir, "prog_candidates")
-    system_prompts = load_system_prompts(prog_candidates_dir, num_candidates)
-
-    # Check how many loaded successfully
-    loaded_count = sum(1 for p in system_prompts.values() if p.get('exists', False) and 'prompt' in p)
-    print(f"Successfully loaded {loaded_count}/{num_candidates} system prompts")
-
-    # Construct training examples - one data point per task with all candidates
-    training_data = []
-
-    print("Constructing training examples (one per task with all candidates)...")
+    print(f"Constructing {split_name} examples (one per task with all candidates)...")
     for task_idx in tqdm.tqdm(range(num_tasks)):
-        task = valset[task_idx]
+        if task_idx >= len(dataset):
+            print(f"Warning: task_idx {task_idx} exceeds dataset size {len(dataset)}, skipping")
+            continue
+
+        task = dataset[task_idx]
         pareto_frontier = pareto_frontiers[task_idx]
 
         # Collect all candidates and their scores for this task
@@ -277,7 +252,7 @@ def construct_training_data(
             if 'prompt' not in system_prompts[candidate_idx]:
                 continue
 
-            reward = prog_candidate_val_subscores[candidate_idx][task_idx]
+            reward = prog_candidate_subscores[candidate_idx][task_idx]
             # Convert boolean to float
             if isinstance(reward, bool):
                 reward = float(reward)
@@ -304,17 +279,118 @@ def construct_training_data(
             }
             training_data.append(training_example)
 
+    return training_data
 
-    # Save training data
-    print(f"Saving {len(training_data)} training examples to {output_file}...")
+
+def construct_training_data(
+    experiment_dir: str,
+    output_file: str,
+    seed: int = 0,
+    benchmark_name: str = None
+):
+    """
+    Construct training and validation datasets for prompt router.
+
+    Args:
+        experiment_dir: Path to the experiment directory
+        output_file: Base path for output files (will create _train.json and _val.json)
+        seed: Random seed for dataset shuffling
+        benchmark_name: Name of the benchmark to use. If None, will be extracted from experiment_dir.
+                       Defaults to 'hoverBench' if not found.
+    """
+    print(f"Loading GEPA state from {experiment_dir}...")
+    state_path = os.path.join(experiment_dir, "gepa_state.bin")
+    state = load_gepa_state(state_path)
+
+    # Extract relevant data from state for BOTH train and val
+    # Training set
+    pareto_frontiers_train = state.get('program_at_pareto_front', None)
+    prog_candidate_train_subscores = state.get('prog_candidate_train_subscores', None)
+
+    # Validation set
+    pareto_frontiers_val = state['program_at_pareto_front_valset']
+    prog_candidate_val_subscores = state['prog_candidate_val_subscores']
+
+    num_candidates = len(prog_candidate_val_subscores)
+
+    # Check if training data is available
+    has_train_data = (pareto_frontiers_train is not None and
+                     prog_candidate_train_subscores is not None)
+
+    if has_train_data:
+        num_train_tasks = len(pareto_frontiers_train)
+        print(f"Found {num_candidates} candidates, {num_train_tasks} train tasks, {len(pareto_frontiers_val)} val tasks")
+    else:
+        print(f"Found {num_candidates} candidates, {len(pareto_frontiers_val)} val tasks (no train data in state)")
+
+    # Determine which benchmark to use
+    if benchmark_name is None:
+        benchmark_name = extract_benchmark_name(experiment_dir)
+        print(f"Detected benchmark: {benchmark_name}")
+    else:
+        print(f"Using specified benchmark: {benchmark_name}")
+
+    # Load system prompts (including actual prompt text)
+    print("Loading system prompt candidates...")
+    prog_candidates_dir = os.path.join(experiment_dir, "prog_candidates")
+    system_prompts = load_system_prompts(prog_candidates_dir, num_candidates)
+
+    # Check how many loaded successfully
+    loaded_count = sum(1 for p in system_prompts.values() if p.get('exists', False) and 'prompt' in p)
+    print(f"Successfully loaded {loaded_count}/{num_candidates} system prompts")
+
+    # Prepare output paths
     output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir = output_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(output_file, 'w') as f:
-        json.dump(training_data, f, indent=2)
+    # Create separate files for train and val
+    base_name = output_path.stem
+    suffix = output_path.suffix
+    train_file = output_dir / f"{base_name}_train{suffix}"
+    val_file = output_dir / f"{base_name}_val{suffix}"
+
+    # Construct TRAINING dataset if available
+    train_data = []
+    if has_train_data:
+        print(f"\nLoading {benchmark_name} training set...")
+        trainset = load_benchmark_dspy_dataset(benchmark_name=benchmark_name, seed=seed, split="train")
+
+        train_data = construct_dataset_split(
+            split_name="train",
+            dataset=trainset,
+            pareto_frontiers=pareto_frontiers_train,
+            prog_candidate_subscores=prog_candidate_train_subscores,
+            system_prompts=system_prompts,
+            num_candidates=num_candidates
+        )
+
+        # Save training data
+        print(f"\nSaving {len(train_data)} training examples to {train_file}...")
+        with open(train_file, 'w') as f:
+            json.dump(train_data, f, indent=2)
+    else:
+        print("\nSkipping training dataset (not available in GEPA state)")
+
+    # Construct VALIDATION dataset
+    print(f"\nLoading {benchmark_name} validation set...")
+    valset = load_benchmark_dspy_dataset(benchmark_name=benchmark_name, seed=seed, split="val")
+
+    val_data = construct_dataset_split(
+        split_name="val",
+        dataset=valset,
+        pareto_frontiers=pareto_frontiers_val,
+        prog_candidate_subscores=prog_candidate_val_subscores,
+        system_prompts=system_prompts,
+        num_candidates=num_candidates
+    )
+
+    # Save validation data
+    with open(val_file, 'w') as f:
+        json.dump(val_data, f, indent=2)
 
     # Save system prompt metadata separately for reference (without full prompt text to save space)
-    metadata_file = output_path.parent / "candidate_metadata.json"
+    metadata_file = output_dir / "candidate_metadata.json"
     metadata_only = {
         idx: {k: v for k, v in prompt_data.items() if k != 'prompt'}
         for idx, prompt_data in system_prompts.items()
@@ -322,51 +398,71 @@ def construct_training_data(
     with open(metadata_file, 'w') as f:
         json.dump(metadata_only, f, indent=2)
 
-    # Compute summary statistics
-    # Collect all rewards from all tasks
-    all_rewards = []
-    for ex in training_data:
-        for candidate in ex["candidates"]:
-            all_rewards.append(candidate["reward"])
+    # Compute summary statistics for TRAINING data
+    def compute_stats(dataset, split_name):
+        """Helper to compute statistics for a dataset split."""
+        all_rewards = []
+        for ex in dataset:
+            for candidate in ex["candidates"]:
+                all_rewards.append(candidate["reward"])
 
-    reward_mean = sum(all_rewards) / len(all_rewards) if all_rewards else 0
-    reward_positive = sum(1 for r in all_rewards if r > 0) / len(all_rewards) if all_rewards else 0
+        reward_mean = sum(all_rewards) / len(all_rewards) if all_rewards else 0
+        reward_positive = sum(1 for r in all_rewards if r > 0) / len(all_rewards) if all_rewards else 0
+        avg_candidates = sum(ex["num_candidates"] for ex in dataset) / len(dataset) if dataset else 0
 
-    # Count average candidates per task
-    avg_candidates = sum(ex["num_candidates"] for ex in training_data) / len(training_data) if training_data else 0
+        return {
+            "split": split_name,
+            "num_tasks": len(dataset),
+            "num_unique_candidates": num_candidates,
+            "avg_candidates_per_task": avg_candidates,
+            "total_task_candidate_pairs": len(all_rewards),
+            "reward_statistics": {
+                "mean": reward_mean,
+                "positive_ratio": reward_positive,
+                "total_positive": sum(1 for r in all_rewards if r > 0),
+                "total_negative": sum(1 for r in all_rewards if r == 0),
+            },
+        }
+
+    # Compute statistics for both splits
+    train_stats = compute_stats(train_data, "train") if train_data else None
+    val_stats = compute_stats(val_data, "val")
 
     summary = {
-        "num_tasks": num_tasks,
-        "num_tasks_in_dataset": len(training_data),
-        "num_unique_candidates": num_candidates,
-        "avg_candidates_per_task": avg_candidates,
-        "total_task_candidate_pairs": len(all_rewards),
         "seed": seed,
         "benchmark_name": benchmark_name,
         "experiment_dir": experiment_dir,
-        "reward_statistics": {
-            "mean": reward_mean,
-            "positive_ratio": reward_positive,
-            "total_positive": sum(1 for r in all_rewards if r > 0),
-            "total_negative": sum(1 for r in all_rewards if r == 0),
-        },
+        "num_unique_candidates": num_candidates,
+        "train": train_stats,
+        "val": val_stats,
     }
 
-    summary_file = output_path.parent / "dataset_summary.json"
+    summary_file = output_dir / "dataset_summary.json"
     with open(summary_file, 'w') as f:
         json.dump(summary, f, indent=2)
 
     print(f"\nDataset construction complete!")
-    print(f"  Training data: {output_file}")
+    if train_data:
+        print(f"  Training data: {train_file}")
+    print(f"  Validation data: {val_file}")
     print(f"  Candidate metadata: {metadata_file}")
     print(f"  Summary: {summary_file}")
+
     print(f"\nSummary:")
-    print(f"  Total tasks in dataset: {len(training_data)}")
-    print(f"  Total unique candidates: {num_candidates}")
-    print(f"  Avg candidates per task: {avg_candidates:.1f}")
-    print(f"  Total task-candidate pairs: {len(all_rewards)}")
-    print(f"  Mean reward: {summary['reward_statistics']['mean']:.4f}")
-    print(f"  Positive ratio: {summary['reward_statistics']['positive_ratio']:.4f}")
+    if train_stats:
+        print(f"\n  TRAINING SET:")
+        print(f"    Tasks: {train_stats['num_tasks']}")
+        print(f"    Avg candidates per task: {train_stats['avg_candidates_per_task']:.1f}")
+        print(f"    Total task-candidate pairs: {train_stats['total_task_candidate_pairs']}")
+        print(f"    Mean reward: {train_stats['reward_statistics']['mean']:.4f}")
+        print(f"    Positive ratio: {train_stats['reward_statistics']['positive_ratio']:.4f}")
+
+    print(f"\n  VALIDATION SET:")
+    print(f"    Tasks: {val_stats['num_tasks']}")
+    print(f"    Avg candidates per task: {val_stats['avg_candidates_per_task']:.1f}")
+    print(f"    Total task-candidate pairs: {val_stats['total_task_candidate_pairs']}")
+    print(f"    Mean reward: {val_stats['reward_statistics']['mean']:.4f}")
+    print(f"    Positive ratio: {val_stats['reward_statistics']['positive_ratio']:.4f}")
 
 
 if __name__ == "__main__":
@@ -376,7 +472,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--experiment_dir",
         type=str,
-        default="experiment_runs_data/experiment_runs/seed_0/hoverBench_HoverMultiHop_GEPA_Qwen3-8B",
+        default="experiment_runs_data/experiment_runs/seed_1/hoverBench_HoverMultiHop_GEPA_Qwen3-8B",
         help="Path to experiment directory"
     )
     parser.add_argument(
