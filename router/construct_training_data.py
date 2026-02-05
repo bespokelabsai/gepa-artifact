@@ -260,14 +260,16 @@ def construct_training_data(
     loaded_count = sum(1 for p in system_prompts.values() if p.get('exists', False) and 'prompt' in p)
     print(f"Successfully loaded {loaded_count}/{num_candidates} system prompts")
 
-    # Construct training examples as (task, candidate, reward) tuples
+    # Construct training examples - one data point per task with all candidates
     training_data = []
 
-    print("Constructing training examples...")
+    print("Constructing training examples (one per task with all candidates)...")
     for task_idx in tqdm.tqdm(range(num_tasks)):
         task = valset[task_idx]
         pareto_frontier = pareto_frontiers[task_idx]
-        # Create one example for each (task, candidate) pair
+
+        # Collect all candidates and their scores for this task
+        candidates = []
         for candidate_idx in range(num_candidates):
             # Skip if prompt wasn't loaded successfully
             if candidate_idx not in system_prompts or not system_prompts[candidate_idx].get('exists', False):
@@ -275,7 +277,6 @@ def construct_training_data(
             if 'prompt' not in system_prompts[candidate_idx]:
                 continue
 
-            import pdb; pdb.set_trace()
             reward = prog_candidate_val_subscores[candidate_idx][task_idx]
             # Convert boolean to float
             if isinstance(reward, bool):
@@ -285,14 +286,21 @@ def construct_training_data(
             else:
                 reward = float(reward)
 
-            # Create training example with all task fields
-            training_example = {
-                "task_idx": task_idx,
-                **task,  # Include all fields from the task
+            candidates.append({
                 "candidate_idx": candidate_idx,
                 "candidate_system_prompt": system_prompts[candidate_idx]["prompt"],
                 "reward": reward,
                 "in_pareto_frontier": candidate_idx in pareto_frontier,
+            })
+
+        # Create one training example per task with all candidates
+        if candidates:  # Only add if we have at least one valid candidate
+            training_example = {
+                "task_idx": task_idx,
+                **task,  # Include all fields from the task
+                "candidates": candidates,
+                "num_candidates": len(candidates),
+                "pareto_frontier": sorted(list(pareto_frontier)),
             }
             training_data.append(training_example)
 
@@ -315,24 +323,33 @@ def construct_training_data(
         json.dump(metadata_only, f, indent=2)
 
     # Compute summary statistics
-    rewards = [ex["reward"] for ex in training_data]
-    reward_mean = sum(rewards) / len(rewards) if rewards else 0
-    reward_positive = sum(1 for r in rewards if r > 0) / len(rewards) if rewards else 0
+    # Collect all rewards from all tasks
+    all_rewards = []
+    for ex in training_data:
+        for candidate in ex["candidates"]:
+            all_rewards.append(candidate["reward"])
+
+    reward_mean = sum(all_rewards) / len(all_rewards) if all_rewards else 0
+    reward_positive = sum(1 for r in all_rewards if r > 0) / len(all_rewards) if all_rewards else 0
+
+    # Count average candidates per task
+    avg_candidates = sum(ex["num_candidates"] for ex in training_data) / len(training_data) if training_data else 0
 
     summary = {
         "num_tasks": num_tasks,
-        "num_candidates": num_candidates,
-        "num_training_examples": len(training_data),
+        "num_tasks_in_dataset": len(training_data),
+        "num_unique_candidates": num_candidates,
+        "avg_candidates_per_task": avg_candidates,
+        "total_task_candidate_pairs": len(all_rewards),
         "seed": seed,
         "benchmark_name": benchmark_name,
         "experiment_dir": experiment_dir,
         "reward_statistics": {
             "mean": reward_mean,
             "positive_ratio": reward_positive,
-            "total_positive": sum(1 for r in rewards if r > 0),
-            "total_negative": sum(1 for r in rewards if r == 0),
+            "total_positive": sum(1 for r in all_rewards if r > 0),
+            "total_negative": sum(1 for r in all_rewards if r == 0),
         },
-        "examples_per_task": len(training_data) / num_tasks if num_tasks > 0 else 0,
     }
 
     summary_file = output_path.parent / "dataset_summary.json"
@@ -344,12 +361,10 @@ def construct_training_data(
     print(f"  Candidate metadata: {metadata_file}")
     print(f"  Summary: {summary_file}")
     print(f"\nSummary:")
-    print(f"  Total tasks: {num_tasks}")
-    print(f"  Total candidates: {num_candidates}")
-    print(f"  Training examples: {len(training_data)}")
-
-    # if strategy in ["all_candidates", "pareto_only"]:
-    print(f"  Examples per task: {len(training_data) / num_tasks:.1f}")
+    print(f"  Total tasks in dataset: {len(training_data)}")
+    print(f"  Total unique candidates: {num_candidates}")
+    print(f"  Avg candidates per task: {avg_candidates:.1f}")
+    print(f"  Total task-candidate pairs: {len(all_rewards)}")
     print(f"  Mean reward: {summary['reward_statistics']['mean']:.4f}")
     print(f"  Positive ratio: {summary['reward_statistics']['positive_ratio']:.4f}")
 

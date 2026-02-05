@@ -1,14 +1,14 @@
 """
-Training script for prompt router with (task, candidate, reward) format.
+Training script for MLP-based prompt router.
 
-Trains a cross-encoder model to predict the reward for each (task, candidate) pair.
+This script trains a cross-encoder model to predict the reward/compatibility
+for (task, candidate) pairs.
 """
 
 import sys
 import os
 from pathlib import Path
 import json
-import pickle
 import argparse
 from typing import Dict, List, Tuple
 import random
@@ -28,76 +28,93 @@ if str(root_dir) not in sys.path:
 from router.model import PromptRouterCrossEncoder
 
 
-class PromptRewardDataset(Dataset):
+class RouterDataset(Dataset):
     """
-    Dataset for training prompt router with explicit rewards.
+    Dataset for training MLP router.
 
-    Each example is a (task, candidate, reward) tuple with the prompt included.
+    New format: Each training example contains a task with all its candidates.
+    During training, we expand this into individual (task, candidate) pairs.
     """
+
+    # Mapping of benchmark names to their input field names
+    BENCHMARK_INPUT_FIELDS = {
+        'hoverBench': 'claim',
+        'HotpotQABench': 'question',
+        'IFBench': 'prompt',
+        'AIMEBench': 'problem',
+        'Papillon': 'user_query',
+    }
 
     def __init__(
         self,
         training_data: List[Dict],
         tokenizer: AutoTokenizer,
         max_length: int = 512,
+        benchmark_name: str = None,
     ):
         """
         Args:
-            training_data: List of dicts with keys: claim, candidate_idx, candidate_prompt, reward
+            training_data: List of task dicts, each containing:
+                - task_idx: int
+                - task input field (e.g., 'claim', 'question')
+                - candidates: List of dicts with candidate_idx, candidate_system_prompt, reward
             tokenizer: Tokenizer for encoding
             max_length: Max sequence length
+            benchmark_name: Name of the benchmark (auto-detected if not provided)
         """
-        self.training_data = training_data
         self.tokenizer = tokenizer
         self.max_length = max_length
 
+        # Auto-detect input field
+        if benchmark_name is None:
+            self.input_field = self._detect_input_field(training_data[0])
+        else:
+            self.input_field = self.BENCHMARK_INPUT_FIELDS.get(benchmark_name, 'claim')
+
+        print(f"Dataset using input field: '{self.input_field}'")
+
+        # Expand the data into (task, candidate, reward) pairs
+        self.pairs = []
+        for task in training_data:
+            task_input = task.get(self.input_field, '')
+            task_idx = task['task_idx']
+
+            for candidate in task['candidates']:
+                self.pairs.append({
+                    'task_idx': task_idx,
+                    'task_input': task_input,
+                    'candidate_idx': candidate['candidate_idx'],
+                    'candidate_prompt': candidate['candidate_system_prompt'],
+                    'reward': candidate['reward'],
+                })
+
+        print(f"Expanded {len(training_data)} tasks into {len(self.pairs)} (task, candidate) pairs")
+
+    def _detect_input_field(self, example: Dict) -> str:
+        """Auto-detect the input field from available fields."""
+        for benchmark, field in self.BENCHMARK_INPUT_FIELDS.items():
+            if field in example:
+                return field
+        return 'claim'
+
     def __len__(self):
-        return len(self.training_data)
+        return len(self.pairs)
 
     def __getitem__(self, idx: int) -> Dict:
-        """
-        Returns a single (task, candidate, reward) example.
-        """
-        example = self.training_data[idx]
-
-        return {
-            'claim': example['claim'],
-            'candidate_idx': example['candidate_idx'],
-            'candidate_prompt': example['candidate_prompt'],
-            'reward': example['reward'],
-            'task_idx': example['task_idx'],
-        }
+        """Returns a single (task, candidate, reward) pair."""
+        return self.pairs[idx]
 
 
 def collate_fn(batch: List[Dict], tokenizer: AutoTokenizer, max_length: int):
-    """Collate batch of samples into tensors."""
-    claims = []
-    prompts = []
-    rewards = []
-    candidate_indices = []
-
-    for sample in batch:
-        claim = sample['claim']
-        candidate_idx = sample['candidate_idx']
-        candidate_prompt = sample['candidate_prompt']
-        reward = sample['reward']
-
-        claims.append(claim)
-        prompts.append(candidate_prompt)
-        rewards.append(reward)
-        candidate_indices.append(candidate_idx)
-
-    if not claims:
-        # Return empty batch
-        return {
-            'input_ids': torch.empty(0, max_length, dtype=torch.long),
-            'attention_mask': torch.empty(0, max_length, dtype=torch.long),
-            'rewards': torch.empty(0, dtype=torch.float),
-        }
+    """Collate batch of (task, candidate, reward) samples."""
+    task_inputs = [sample['task_input'] for sample in batch]
+    prompts = [sample['candidate_prompt'] for sample in batch]
+    rewards = [sample['reward'] for sample in batch]
+    candidate_indices = [sample['candidate_idx'] for sample in batch]
 
     # Tokenize all pairs
     encoded = tokenizer(
-        claims,
+        task_inputs,
         prompts,
         padding='max_length',
         truncation=True,
@@ -131,9 +148,6 @@ def train_epoch(
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
     for batch in pbar:
-        if batch['input_ids'].size(0) == 0:
-            continue
-
         # Move to device
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
@@ -146,11 +160,9 @@ def train_epoch(
 
         # Compute loss
         if loss_type == "bce":
-            # Binary cross-entropy (treat as classification)
             loss = nn.functional.binary_cross_entropy_with_logits(scores, rewards)
         elif loss_type == "mse":
-            # Mean squared error (treat as regression)
-            scores = torch.sigmoid(scores)  # Scale to [0, 1]
+            scores = torch.sigmoid(scores)
             loss = nn.functional.mse_loss(scores, rewards)
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
@@ -173,57 +185,49 @@ def train_epoch(
 def evaluate(
     model: nn.Module,
     val_data: List[Dict],
-    system_prompts: Dict[int, str],
     tokenizer: AutoTokenizer,
     device: torch.device,
     max_length: int = 512,
-    batch_size: int = 16
+    batch_size: int = 16,
+    input_field: str = 'claim'
 ) -> Tuple[float, Dict]:
     """
     Evaluate model on validation set.
 
     For each task, score all candidates and pick the best one.
-    Compare with ground truth rewards.
     """
     model.eval()
 
-    # Group data by task
-    tasks = {}
-    for ex in val_data:
-        task_idx = ex['task_idx']
-        if task_idx not in tasks:
-            tasks[task_idx] = []
-        tasks[task_idx].append(ex)
-
-    # Metrics
     correct_top1 = 0
     correct_top3 = 0
     correct_top5 = 0
     total_tasks = 0
 
-    # Reward prediction metrics
     all_pred_scores = []
     all_true_rewards = []
 
-    for task_idx, task_examples in tqdm(tasks.items(), desc="Evaluating"):
-        # Get claim (same for all examples of this task)
-        claim = task_examples[0]['claim']
+    for task in tqdm(val_data, desc="Evaluating"):
+        task_input = task.get(input_field, '')
+        candidates = task['candidates']
 
-        # Score all candidates for this task
+        if not candidates:
+            continue
+
+        # Score all candidates
         candidate_scores = {}
         true_rewards = {}
 
-        for ex in task_examples:
-            candidate_idx = ex['candidate_idx']
-            true_rewards[candidate_idx] = ex['reward']
+        # Process candidates in batches
+        for i in range(0, len(candidates), batch_size):
+            batch_candidates = candidates[i:i + batch_size]
 
-            if candidate_idx not in system_prompts:
-                continue
+            task_inputs = [task_input] * len(batch_candidates)
+            prompts = [c['candidate_system_prompt'] for c in batch_candidates]
 
             # Tokenize
             encoded = tokenizer(
-                [claim],
-                [system_prompts[candidate_idx]],
+                task_inputs,
+                prompts,
                 padding='max_length',
                 truncation=True,
                 max_length=max_length,
@@ -237,44 +241,49 @@ def evaluate(
             if token_type_ids is not None:
                 token_type_ids = token_type_ids.to(device)
 
-            score = model(input_ids, attention_mask, token_type_ids)
-            score = torch.sigmoid(score).cpu().item()
+            batch_scores = model(input_ids, attention_mask, token_type_ids)
+            batch_scores = torch.sigmoid(batch_scores).cpu().numpy()
 
-            candidate_scores[candidate_idx] = score
-            all_pred_scores.append(score)
-            all_true_rewards.append(true_rewards[candidate_idx])
+            for candidate, score in zip(batch_candidates, batch_scores):
+                candidate_idx = candidate['candidate_idx']
+                candidate_scores[candidate_idx] = float(score)
+                true_rewards[candidate_idx] = candidate['reward']
+
+        # Track all predictions
+        for idx in candidate_scores:
+            all_pred_scores.append(candidate_scores[idx])
+            all_true_rewards.append(true_rewards[idx])
 
         # Get top predictions
-        sorted_candidates = sorted(candidate_scores.items(), key=lambda x: x[1], reverse=True)
+        sorted_candidates = sorted(
+            candidate_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
 
-        # Find best candidate according to ground truth
-        best_true_candidates = [c for c, r in true_rewards.items() if r == max(true_rewards.values())]
+        # Find best candidate(s) according to ground truth
+        best_reward = max(true_rewards.values())
+        best_candidates = [idx for idx, r in true_rewards.items() if r == best_reward]
 
-        if not sorted_candidates:
-            continue
+        # Check top-k accuracy
+        pred_top1 = [sorted_candidates[0][0]] if sorted_candidates else []
+        pred_top3 = [c[0] for c in sorted_candidates[:3]]
+        pred_top5 = [c[0] for c in sorted_candidates[:5]]
 
-        # Check if predicted best is in true best
-        pred_best = sorted_candidates[0][0]
-        pred_top3 = [c for c, _ in sorted_candidates[:3]]
-        pred_top5 = [c for c, _ in sorted_candidates[:5]]
-
-        if pred_best in best_true_candidates:
+        if any(c in best_candidates for c in pred_top1):
             correct_top1 += 1
-
-        if any(c in best_true_candidates for c in pred_top3):
+        if any(c in best_candidates for c in pred_top3):
             correct_top3 += 1
-
-        if any(c in best_true_candidates for c in pred_top5):
+        if any(c in best_candidates for c in pred_top5):
             correct_top5 += 1
 
         total_tasks += 1
 
-    # Compute accuracies
+    # Compute metrics
     top1_acc = correct_top1 / total_tasks if total_tasks > 0 else 0
     top3_acc = correct_top3 / total_tasks if total_tasks > 0 else 0
     top5_acc = correct_top5 / total_tasks if total_tasks > 0 else 0
 
-    # Compute reward prediction metrics
     mse = np.mean([(p - t)**2 for p, t in zip(all_pred_scores, all_true_rewards)])
     mae = np.mean([abs(p - t) for p, t in zip(all_pred_scores, all_true_rewards)])
 
@@ -291,26 +300,26 @@ def evaluate(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train prompt router with reward prediction")
+    parser = argparse.ArgumentParser(description="Train MLP prompt router")
 
     # Data arguments
     parser.add_argument(
         '--training_data',
         type=str,
-        default='router/training_data_all.json',
+        required=True,
         help='Path to training data JSON'
-    )
-    parser.add_argument(
-        '--prog_candidates_dir',
-        type=str,
-        default='experiment_runs_data/experiment_runs/seed_0/hoverBench_HoverMultiHop_GEPA_Qwen3-8B/prog_candidates',
-        help='Directory with program candidates (optional, only for reference)'
     )
     parser.add_argument(
         '--val_split',
         type=float,
         default=0.2,
         help='Validation split ratio'
+    )
+    parser.add_argument(
+        '--benchmark_name',
+        type=str,
+        default=None,
+        help='Benchmark name (auto-detected if not specified)'
     )
 
     # Model arguments
@@ -363,7 +372,7 @@ def main():
         type=str,
         choices=['bce', 'mse'],
         default='bce',
-        help='Loss function: bce (binary cross-entropy) or mse (mean squared error)'
+        help='Loss function'
     )
     parser.add_argument(
         '--seed',
@@ -403,58 +412,44 @@ def main():
     print(f"\nLoading training data from {args.training_data}...")
     with open(args.training_data) as f:
         all_data = json.load(f)
-    print(f"Loaded {len(all_data)} examples")
+    print(f"Loaded {len(all_data)} tasks")
 
-    # Check if prompts are included in the data
-    if 'candidate_prompt' not in all_data[0]:
-        print("\nERROR: Training data doesn't include candidate_prompt field!")
-        print("Please regenerate the dataset with:")
-        print("  python router/construct_training_data.py --strategy all_candidates")
-        sys.exit(1)
+    # Auto-detect benchmark if needed
+    if args.benchmark_name is None:
+        # Use the dataset's detection logic
+        benchmark_name = RouterDataset._detect_input_field(None, all_data[0])
+        input_field = benchmark_name
+    else:
+        input_field = RouterDataset.BENCHMARK_INPUT_FIELDS.get(
+            args.benchmark_name, 'claim'
+        )
 
-    # Extract unique prompts for later use (e.g., for evaluation)
-    system_prompts = {}
-    for ex in all_data:
-        if ex['candidate_idx'] not in system_prompts:
-            system_prompts[ex['candidate_idx']] = ex['candidate_prompt']
-
-    print(f"Found {len(system_prompts)} unique system prompt candidates in data")
-
-    # Split by task (not by example) to avoid leakage
-    # Group by task first
-    tasks = {}
-    for ex in all_data:
-        task_idx = ex['task_idx']
-        if task_idx not in tasks:
-            tasks[task_idx] = []
-        tasks[task_idx].append(ex)
-
-    task_indices = list(tasks.keys())
+    # Split by task to avoid leakage
+    task_indices = list(range(len(all_data)))
     random.shuffle(task_indices)
 
     val_size = int(len(task_indices) * args.val_split)
     val_task_indices = set(task_indices[:val_size])
     train_task_indices = set(task_indices[val_size:])
 
-    # Split examples based on task assignment
-    train_data = [ex for ex in all_data if ex['task_idx'] in train_task_indices]
-    val_data = [ex for ex in all_data if ex['task_idx'] in val_task_indices]
+    train_data = [all_data[i] for i in train_task_indices]
+    val_data = [all_data[i] for i in val_task_indices]
 
-    print(f"\nSplit: {len(train_data)} train examples ({len(train_task_indices)} tasks), "
-          f"{len(val_data)} val examples ({len(val_task_indices)} tasks)")
+    print(f"\nSplit: {len(train_data)} train tasks, {len(val_data)} val tasks")
 
     # Load tokenizer
     print(f"\nLoading tokenizer: {args.backbone}")
     tokenizer = AutoTokenizer.from_pretrained(args.backbone)
 
     # Create datasets
-    train_dataset = PromptRewardDataset(
+    train_dataset = RouterDataset(
         train_data,
         tokenizer,
         max_length=args.max_length,
+        benchmark_name=args.benchmark_name
     )
 
-    # Create dataloaders
+    # Create dataloader
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -471,7 +466,6 @@ def main():
     )
     model = model.to(device)
 
-    # Count parameters
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model has {num_params:,} trainable parameters")
 
@@ -517,12 +511,9 @@ def main():
         # Evaluate
         print("\nEvaluating on validation set...")
         val_acc, val_metrics = evaluate(
-            model,
-            val_data,
-            system_prompts,
-            tokenizer,
-            device,
-            max_length=args.max_length
+            model, val_data, tokenizer, device,
+            max_length=args.max_length,
+            input_field=input_field
         )
 
         print(f"\nValidation Results:")
@@ -531,7 +522,6 @@ def main():
         print(f"  Top-5 Accuracy: {val_metrics['top_5_accuracy']:.4f}")
         print(f"  Reward MSE: {val_metrics['reward_mse']:.4f}")
         print(f"  Reward MAE: {val_metrics['reward_mae']:.4f}")
-        print(f"  Total tasks: {val_metrics['total_tasks']}")
 
         # Save history
         training_history.append({
