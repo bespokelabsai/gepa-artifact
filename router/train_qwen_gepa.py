@@ -300,12 +300,6 @@ def main():
         default='openai/gpt-5',
         help='Reflection LM for GEPA error analysis and prompt improvement'
     )
-    parser.add_argument(
-        '--api_key',
-        type=str,
-        default=None,
-        help='API key for the model'
-    )
 
     # GEPA optimizer arguments
     parser.add_argument(
@@ -379,7 +373,8 @@ def main():
 
     # Setup DSPy LMs
     print(f"\nSetting up language models...")
-    api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY")
+    wandb_key = os.environ.get("WANDB_API_KEY")
 
     # Student LM (for inference)
     print(f"  Student LM: {args.model}")
@@ -472,6 +467,8 @@ def main():
         'reflection_minibatch_size': args.reflection_minibatch_size,
         'track_best_outputs': True,
         'add_format_failure_as_feedback': True,
+        'use_wandb': True,
+        "wandb_api_key": wandb_key,
     }
 
     # Add budget control (either auto or manual)
