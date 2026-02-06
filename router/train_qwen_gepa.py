@@ -504,8 +504,7 @@ def main():
 
     baseline_score = baseline_evaluator(router_module)
 
-    import pdb; pdb.set_trace()
-    print(f"\n✓ Baseline validation score: {baseline_score:.4f}")
+    print(f"\n✓ Baseline validation score: {baseline_score:}")
     print(f"  (Average reward of selected candidates)")
 
     # Run GEPA optimization
@@ -545,7 +544,7 @@ def main():
         )
 
         optimized_score = final_evaluator(optimized_router)
-        print(f"\n✓ Optimized validation score: {optimized_score:.4f}")
+        print(f"\n✓ Optimized validation score: {optimized_score}")
 
         # Show improvement
         improvement = optimized_score - baseline_score
@@ -553,10 +552,10 @@ def main():
         print(f"\n{'='*80}")
         print("PERFORMANCE IMPROVEMENT")
         print(f"{'='*80}")
-        print(f"  Baseline score:   {baseline_score:.4f}")
-        print(f"  Optimized score:  {optimized_score:.4f}")
-        print(f"  Absolute gain:    {improvement:+.4f}")
-        print(f"  Relative gain:    {improvement_pct:+.1f}%")
+        print(f"  Baseline score:   {baseline_score}")
+        print(f"  Optimized score:  {optimized_score}")
+        print(f"  Absolute gain:    {improvement}")
+        print(f"  Relative gain:    {improvement_pct}%")
 
         # Show optimized instructions
         print(f"\n{'='*80}")

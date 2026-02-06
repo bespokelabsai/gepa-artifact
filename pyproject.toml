@@ -57,10 +57,6 @@ dependencies = [
     "datasets==3.6.0"
 ]
 
-[tool.uv.sources]
-arbor-ai = { path = "gepa_artifact/utils/arbor", editable = true }
-dspy = { path = "gepa_artifact/utils/dspy", editable = true }
-
 [tool.uv]
 no-build-isolation-package = ["flash-attn"]
 
