@@ -385,7 +385,6 @@ def main():
     else:
         lm = dspy.LM(args.model, api_base="http://localhost:8000/v1", api_key="api_key", temperature=1.0, max_tokens=32000)
 
-    import pdb; pdb.set_trace()
     # Reflection LM (for GEPA meta-cognitive analysis)
     print(f"  Reflection LM: {args.reflection_model}")
     if "gpt" in args.reflection_model.lower():
@@ -501,7 +500,7 @@ def main():
 
     baseline_score = baseline_evaluator(router_module)
 
-    print(f"\n✓ Baseline validation score: {baseline_score:}")
+    print(f"\n✓ Baseline validation score: {baseline_score.score}")
     print(f"  (Average reward of selected candidates)")
 
     # Run GEPA optimization
@@ -541,16 +540,16 @@ def main():
         )
 
         optimized_score = final_evaluator(optimized_router)
-        print(f"\n✓ Optimized validation score: {optimized_score}")
+        print(f"\n✓ Optimized validation score: {optimized_score.score}")
 
         # Show improvement
-        improvement = optimized_score - baseline_score
+        improvement = optimized_score.score - baseline_score.score
         improvement_pct = (improvement / baseline_score * 100) if baseline_score > 0 else 0
         print(f"\n{'='*80}")
         print("PERFORMANCE IMPROVEMENT")
         print(f"{'='*80}")
-        print(f"  Baseline score:   {baseline_score}")
-        print(f"  Optimized score:  {optimized_score}")
+        print(f"  Baseline score:   {baseline_score.score}")
+        print(f"  Optimized score:  {optimized_score.score}")
         print(f"  Absolute gain:    {improvement}")
         print(f"  Relative gain:    {improvement_pct}%")
 
