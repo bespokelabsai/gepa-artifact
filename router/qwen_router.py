@@ -120,19 +120,19 @@ class QwenRouter(Router):
         print(f"Warning: Could not parse candidate selection from output: {output[:100]}")
         return candidates[0]['candidate_idx']
 
-    def select_candidate(
+    async def _select_candidate_impl(
         self,
         task_input: str,
         candidates: List[Dict],
         return_scores: bool = False
     ) -> Union[int, tuple]:
         """
-        Use the LM to select the best candidate for a given task.
+        Internal async implementation for selecting a candidate.
 
         Args:
             task_input: The input text for the task
             candidates: List of candidate dicts
-            return_scores: If True, return scores (not implemented for LM-based router)
+            return_scores: If True, return scores
 
         Returns:
             candidate_idx or (candidate_idx, scores_dict)
@@ -141,15 +141,15 @@ class QwenRouter(Router):
             raise ValueError("Cannot select from empty candidate list")
 
         # Format candidates for the LM
-        # candidates = [candidate['candidate_system_prompt'] for candidate in candidates]
         candidates_str = '\n'.join([f"{idx}.\n{candidate['candidate_system_prompt']}" for idx, candidate in enumerate(candidates)])
 
-        # Call the LM
+        # Call the LM - wrap synchronous DSPy call to make it non-blocking
         try:
-            prediction = self.predictor(
+            prediction = await self.predictor.acall(
                 task_input=task_input,
                 candidates=candidates_str
             )
+            print(f"Prediction: {prediction}")
             # Parse the selection
             selected_idx = self._parse_selection(
                 prediction.selected_candidate_idx,
@@ -170,6 +170,28 @@ class QwenRouter(Router):
 
         return selected_idx
 
+    def select_candidate(
+        self,
+        task_input: str,
+        candidates: List[Dict],
+        return_scores: bool = False
+    ) -> Union[int, tuple]:
+        """
+        Use the LM to select the best candidate for a given task.
+
+        This is a synchronous wrapper that runs the async implementation.
+
+        Args:
+            task_input: The input text for the task
+            candidates: List of candidate dicts
+            return_scores: If True, return scores
+
+        Returns:
+            candidate_idx or (candidate_idx, scores_dict)
+        """
+        # Run the async implementation synchronously
+        return asyncio.run(self._select_candidate_impl(task_input, candidates, return_scores))
+
     async def select_candidate_async(
         self,
         task_input: str,
@@ -187,12 +209,7 @@ class QwenRouter(Router):
         Returns:
             candidate_idx or (candidate_idx, scores_dict)
         """
-        # Run the synchronous call in an executor to avoid blocking
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self.select_candidate(task_input, candidates, return_scores)
-        )
+        return await self._select_candidate_impl(task_input, candidates, return_scores)
 
     def batch_select_candidates(
         self,
@@ -203,8 +220,8 @@ class QwenRouter(Router):
         """
         Select candidates for multiple tasks.
 
-        Note: Currently processes each task sequentially.
-        Could be optimized with batch LM calls in the future.
+        This is a synchronous wrapper for compatibility with the base Router interface.
+        For better performance, use batch_select_candidates_async instead.
 
         Args:
             task_inputs: List of input texts
@@ -214,21 +231,12 @@ class QwenRouter(Router):
         Returns:
             List of selected candidate indices or (indices, scores)
         """
-        selected_indices = []
-        all_scores = [] if return_scores else None
-
-        for task_input, candidates in zip(task_inputs, candidates_list):
-            if return_scores:
-                idx, scores = self.select_candidate(task_input, candidates, return_scores=True)
-                selected_indices.append(idx)
-                all_scores.append(scores)
-            else:
-                idx = self.select_candidate(task_input, candidates, return_scores=False)
-                selected_indices.append(idx)
-
-        if return_scores:
-            return selected_indices, all_scores
-        return selected_indices
+        # Run the async batch method in a single event loop for efficiency
+        return asyncio.run(
+            self.batch_select_candidates_async(
+                task_inputs, candidates_list, return_scores, max_concurrent=10
+            )
+        )
 
     async def batch_select_candidates_async(
         self,

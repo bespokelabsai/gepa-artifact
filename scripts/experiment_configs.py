@@ -68,6 +68,7 @@ def get_benchmarks():
 def get_optimizers():
     import dspy
     from gepa_artifact.gepa.gepa import GEPA
+    # from dspy import GEPA
     from dspy.teleprompt.grpo import GRPO
     from gepa_artifact.utils.optimizers import OptimizerConfig
     optimizers = [

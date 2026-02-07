@@ -263,10 +263,16 @@ def main():
         help='Path to training data JSON'
     )
     parser.add_argument(
+        '--val_data',
+        type=str,
+        default=None,
+        help='Path to validation data JSON (if not provided, splits from training data)'
+    )
+    parser.add_argument(
         '--val_split',
         type=float,
         default=0.2,
-        help='Validation split ratio'
+        help='Validation split ratio (used only if val_data is not provided)'
     )
     parser.add_argument(
         '--max_train_samples',
@@ -401,8 +407,26 @@ def main():
     # Load training data
     print(f"\nLoading training data from {args.training_data}...")
     with open(args.training_data) as f:
-        all_data = json.load(f)
-    print(f"Loaded {len(all_data)} tasks")
+        train_data = json.load(f)
+    print(f"Loaded {len(train_data)} training tasks")
+
+    # Load or split validation data
+    if args.val_data is not None:
+        print(f"\nLoading validation data from {args.val_data}...")
+        with open(args.val_data) as f:
+            val_data = json.load(f)
+        print(f"Loaded {len(val_data)} validation tasks")
+
+        # Shuffle training data only
+        random.shuffle(train_data)
+    else:
+        print(f"\nNo separate validation data provided. Splitting from training data...")
+        # Split data into train and validation
+        random.shuffle(train_data)
+        val_size = int(len(train_data) * args.val_split)
+        val_data = train_data[:val_size]
+        train_data = train_data[val_size:]
+        print(f"Split with ratio {args.val_split}: {len(train_data)} train, {len(val_data)} val tasks")
 
     # Detect input field based on benchmark
     BENCHMARK_INPUT_FIELDS = {
@@ -415,19 +439,13 @@ def main():
     input_field = BENCHMARK_INPUT_FIELDS.get(args.benchmark_name, 'claim')
     print(f"Using input field: '{input_field}'")
 
-    # Split data into train and validation
-    random.shuffle(all_data)
-    val_size = int(len(all_data) * args.val_split)
-    train_data = all_data[val_size:]
-    val_data = all_data[:val_size]
-
     # Limit sample sizes
     if args.max_train_samples and len(train_data) > args.max_train_samples:
         train_data = train_data[:args.max_train_samples]
     if args.max_val_samples and len(val_data) > args.max_val_samples:
         val_data = val_data[:args.max_val_samples]
 
-    print(f"Split: {len(train_data)} train tasks, {len(val_data)} val tasks")
+    print(f"Final sizes: {len(train_data)} train tasks, {len(val_data)} val tasks")
 
     # Convert to DSPy examples
     print("\nConverting to DSPy examples...")
