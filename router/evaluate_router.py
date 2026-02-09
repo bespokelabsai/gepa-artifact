@@ -492,7 +492,7 @@ def main():
     parser.add_argument(
         '--seed',
         type=int,
-        default=42,
+        default=0,
         help='Random seed for RandomRouter'
     )
     parser.add_argument(

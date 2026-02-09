@@ -6,7 +6,6 @@ from the Pareto frontier based on GEPA optimization results.
 """
 
 import sys
-import pickle
 import json
 import os
 from pathlib import Path
@@ -16,10 +15,56 @@ from datasets import load_dataset
 import tqdm
 import importlib
 
-# Add gepa_artifact to path for loading pickle files
+# Add paths for importing benchmarks and gepa_artifact modules
 root_dir = Path(__file__).parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
+
+# Add gepa_artifact directory to allow "benchmarks" to be imported as a top-level module
+gepa_artifact_dir = root_dir / "gepa_artifact"
+if str(gepa_artifact_dir) not in sys.path:
+    sys.path.insert(0, str(gepa_artifact_dir))
+
+# Add benchmarks directory to allow benchmark packages like "langProBe" to be imported as top-level modules
+benchmarks_dir = gepa_artifact_dir / "benchmarks"
+if str(benchmarks_dir) not in sys.path:
+    sys.path.insert(0, str(benchmarks_dir))
+
+# # Add the nested langProBe directory to allow direct import of langProBe.benchmark
+# langprobe_nested_dir = benchmarks_dir / "langProBe" / "langProBe"
+# if str(langprobe_nested_dir) not in sys.path:
+#     sys.path.insert(0, str(langprobe_nested_dir))
+
+# from langProBe.langProBe.dspy_program import LangProBeDSPyMetaProgram
+import pickle
+import builtins
+
+# Inject LangProBeDSPyMetaProgram into builtins so it's available globally
+# This allows langProBe modules to find it when they're imported
+# builtins.LangProBeDSPyMetaProgram = LangProBeDSPyMetaProgram
+
+
+# Fix Pydantic v2 compatibility with older pickled DSPy objects
+# The pickles were created with DSPy 2.6.23 which used older Pydantic
+# DSPy 3.1.3 uses newer Pydantic which removed the 'exclude_if' attribute
+try:
+    from pydantic.fields import FieldInfo
+
+    # Store the original __getattribute__ method
+    original_getattribute = FieldInfo.__getattribute__
+
+    def patched_getattribute(self, name):
+        """Patched version that returns None for 'exclude_if'"""
+        if name == 'exclude_if':
+            return None
+        return original_getattribute(self, name)
+
+    # Apply the patch
+    FieldInfo.__getattribute__ = patched_getattribute
+    print("Applied Pydantic compatibility patch for DSPy 2.6.23 -> 3.1.3 migration")
+
+except Exception as e:
+    print(f"Warning: Could not apply Pydantic compatibility patch: {e}")
 
 
 def extract_benchmark_name(experiment_dir: str) -> str:
@@ -33,6 +78,34 @@ def extract_benchmark_name(experiment_dir: str) -> str:
     # Split by underscore and take the first part
     benchmark_name = dir_name.split('_')[0]
     return benchmark_name
+
+
+def get_experiment_dir_for_benchmark(benchmark_name: str, seed: int = 0) -> str:
+    """
+    Construct the experiment directory path for a given benchmark.
+
+    Args:
+        benchmark_name: Name of the benchmark
+        seed: Random seed number (default: 0)
+
+    Returns:
+        Full path to the experiment directory
+    """
+    # Mapping of benchmark names to their experiment directory patterns
+    benchmark_dirs = {
+        'hoverBench': f'experiment_runs_data/experiment_runs/seed_{seed}/hoverBench_HoverMultiHop_GEPA_qwen3-8b',
+        'HotpotQABench': f'experiment_runs_data/experiment_runs/seed_{seed}/HotpotQABench_HotpotQA_GEPA_qwen3-8b',
+        'IFBench': f'experiment_runs_data/experiment_runs/seed_{seed}/IFBench_IFEval_GEPA_qwen3-8b',
+        'AIMEBench': f'experiment_runs_data/experiment_runs/seed_{seed}/AIMEBench_AIME_GEPA_qwen3-8b',
+        'Papillon': f'experiment_runs_data/experiment_runs/seed_{seed}/Papillon_Papillon_GEPA_qwen3-8b',
+    }
+
+    # Default to hoverBench if benchmark not recognized
+    if benchmark_name not in benchmark_dirs:
+        print(f"Warning: Benchmark '{benchmark_name}' not recognized. Defaulting to 'hoverBench'")
+        benchmark_name = 'hoverBench'
+
+    return benchmark_dirs[benchmark_name]
 
 
 def load_benchmark_dspy_dataset(benchmark_name: str = "hoverBench", seed: int = 0, split: str = "val"):
@@ -49,11 +122,11 @@ def load_benchmark_dspy_dataset(benchmark_name: str = "hoverBench", seed: int = 
     """
     # Mapping of benchmark names to their module paths
     benchmark_modules = {
-        'hoverBench': 'gepa_artifact.benchmarks.hover.hover_data',
-        'HotpotQABench': 'gepa_artifact.benchmarks.hotpotQA.hotpot_data',
-        'IFBench': 'gepa_artifact.benchmarks.IFBench.ifbench_data',
-        'AIMEBench': 'gepa_artifact.benchmarks.AIME.AIME_data',
-        'Papillon': 'gepa_artifact.benchmarks.papillon.papillon_data',
+        'hoverBench': 'gepa_artifact.benchmarks.langProBe.langProBe.langProBe.hover.hover_data',
+        'HotpotQABench': 'gepa_artifact.benchmarks.langProBe.langProBe.langProBe.hotpotQA.hotpot_data',
+        'IFBench': 'gepa_artifact.benchmarks.langProBe.langProBe.langProBe.IFBench.ifbench_data',
+        'AIMEBench': 'gepa_artifact.benchmarks.langProBe.langProBe.langProBe.AIME.AIME_data',
+        'Papillon': 'gepa_artifact.benchmarks.langProBe.langProBe.langProBe.papillon.papillon_data',
     }
 
     # Default to hover if benchmark not recognized
@@ -123,9 +196,14 @@ def load_hover_valset(seed: int = 0) -> List[Dict]:
     return reformatted_hf_trainset
 
 
-def load_system_prompts(prog_candidates_dir: str, num_candidates: int) -> Dict[int, Dict]:
+def load_system_prompts(prog_candidates_dir: str, num_candidates: int, skip_first: bool = False) -> Dict[int, Dict]:
     """
     Load system prompt candidates including the actual prompt text.
+
+    Args:
+        prog_candidates_dir: Directory containing program candidates
+        num_candidates: Total number of candidates (including skipped ones)
+        skip_first: If True, skip candidate 0
 
     Returns dict with structure:
     {
@@ -139,7 +217,8 @@ def load_system_prompts(prog_candidates_dir: str, num_candidates: int) -> Dict[i
     """
     system_prompts = {}
 
-    for candidate_idx in range(num_candidates):
+    start_idx = 1 if skip_first else 0
+    for candidate_idx in range(start_idx, num_candidates):
         prog_dir = os.path.join(prog_candidates_dir, str(candidate_idx))
         prog_path = os.path.join(prog_dir, "program.pkl")
         metadata_path = os.path.join(prog_dir, "metadata.json")
@@ -149,6 +228,8 @@ def load_system_prompts(prog_candidates_dir: str, num_candidates: int) -> Dict[i
                 # Load the actual program to get prompt text
                 with open(prog_path, 'rb') as f:
                     program = pickle.load(f)
+
+                # Get string representation (Pydantic patch applied at import time)
                 prompt_text = str(program)
 
                 metadata = {
@@ -166,7 +247,12 @@ def load_system_prompts(prog_candidates_dir: str, num_candidates: int) -> Dict[i
                 system_prompts[candidate_idx] = metadata
 
             except Exception as e:
-                print(f"Warning: Failed to load candidate {candidate_idx}: {e}")
+                import traceback
+                if candidate_idx == 0:  # Print full traceback for first candidate
+                    print(f"Warning: Failed to load candidate {candidate_idx}:")
+                    traceback.print_exc()
+                else:
+                    print(f"Warning: Failed to load candidate {candidate_idx}: {e}")
                 system_prompts[candidate_idx] = {
                     "exists": False,
                     "error": str(e)
@@ -178,61 +264,30 @@ def load_system_prompts(prog_candidates_dir: str, num_candidates: int) -> Dict[i
     return system_prompts
 
 
-def select_best_candidate_for_task(
-    task_idx: int,
-    pareto_frontier: Set[int],
-    candidate_subscores: List[List],
-) -> int:
-    """
-    Select the best candidate for a task from its Pareto frontier.
-
-    Strategy: Among the Pareto frontier candidates, pick the one with the best score
-    on this specific task.
-    """
-    if not pareto_frontier:
-        # If no pareto frontier, return a default (shouldn't happen)
-        return 0
-
-    best_candidate = None
-    best_score = -float('inf')
-
-    for candidate_idx in pareto_frontier:
-        score = candidate_subscores[candidate_idx][task_idx]
-        # Convert boolean to int for comparison
-        if isinstance(score, bool):
-            score = int(score)
-
-        if score > best_score:
-            best_score = score
-            best_candidate = candidate_idx
-
-    return best_candidate
-
-
 def construct_dataset_split(
     split_name: str,
     dataset: List,
-    pareto_frontiers: List[Set[int]],
     prog_candidate_subscores: List[List],
     system_prompts: Dict[int, Dict],
-    num_candidates: int
+    num_candidates: int,
+    candidate_offset: int = 0
 ) -> List[Dict]:
     """
-    Helper function to construct dataset for a specific split (train or val).
+    Helper function to construct dataset for a specific split.
 
     Args:
         split_name: Name of the split ('train' or 'val')
         dataset: The dataset examples
-        pareto_frontiers: List of pareto frontiers (one per task)
-        prog_candidate_subscores: Candidate scores for this split
-        system_prompts: Dict of system prompts
-        num_candidates: Total number of candidates
+        prog_candidate_subscores: Candidate scores for this split (programs x tasks)
+        system_prompts: Dict of system prompts (keyed by original candidate indices)
+        num_candidates: Total number of candidates in the scores array
+        candidate_offset: Offset to add to score indices to get original candidate indices (e.g., 1 if we skipped candidate 0)
 
     Returns:
         List of training examples for this split
     """
     training_data = []
-    num_tasks = len(pareto_frontiers)
+    num_tasks = len(prog_candidate_subscores[0]) if num_candidates > 0 else 0
 
     print(f"Constructing {split_name} examples (one per task with all candidates)...")
     for task_idx in tqdm.tqdm(range(num_tasks)):
@@ -241,18 +296,23 @@ def construct_dataset_split(
             continue
 
         task = dataset[task_idx]
-        pareto_frontier = pareto_frontiers[task_idx]
 
         # Collect all candidates and their scores for this task
         candidates = []
-        for candidate_idx in range(num_candidates):
+        best_score = -float('inf')
+        best_candidate_idx = None
+
+        for score_idx in range(num_candidates):
+            # Map score index to original candidate index
+            candidate_idx = score_idx + candidate_offset
+
             # Skip if prompt wasn't loaded successfully
             if candidate_idx not in system_prompts or not system_prompts[candidate_idx].get('exists', False):
                 continue
             if 'prompt' not in system_prompts[candidate_idx]:
                 continue
 
-            reward = prog_candidate_subscores[candidate_idx][task_idx]
+            reward = prog_candidate_subscores[score_idx][task_idx]
             # Convert boolean to float
             if isinstance(reward, bool):
                 reward = float(reward)
@@ -261,11 +321,15 @@ def construct_dataset_split(
             else:
                 reward = float(reward)
 
+            # Track best candidate for this task
+            if reward > best_score:
+                best_score = reward
+                best_candidate_idx = candidate_idx
+
             candidates.append({
                 "candidate_idx": candidate_idx,
                 "candidate_system_prompt": system_prompts[candidate_idx]["prompt"],
                 "reward": reward,
-                "in_pareto_frontier": candidate_idx in pareto_frontier,
             })
 
         # Create one training example per task with all candidates
@@ -275,7 +339,8 @@ def construct_dataset_split(
                 **task,  # Include all fields from the task
                 "candidates": candidates,
                 "num_candidates": len(candidates),
-                "pareto_frontier": sorted(list(pareto_frontier)),
+                "best_candidate_idx": best_candidate_idx,
+                "best_score": best_score,
             }
             training_data.append(training_example)
 
@@ -302,26 +367,13 @@ def construct_training_data(
     state_path = os.path.join(experiment_dir, "gepa_state.bin")
     state = load_gepa_state(state_path)
 
-    # Extract relevant data from state for BOTH train and val
-    # Training set
-    pareto_frontiers_train = state.get('program_at_pareto_front', None)
-    prog_candidate_train_subscores = state.get('prog_candidate_train_subscores', None)
-
-    # Validation set
-    pareto_frontiers_val = state['program_at_pareto_front_valset']
-    prog_candidate_val_subscores = state['prog_candidate_val_subscores']
+    # Extract ONLY validation scores, SKIPPING candidate 0
+    prog_candidate_val_subscores = state['prog_candidate_val_subscores'][1:]
 
     num_candidates = len(prog_candidate_val_subscores)
+    num_val_tasks = len(prog_candidate_val_subscores[0]) if num_candidates > 0 else 0
 
-    # Check if training data is available
-    has_train_data = (pareto_frontiers_train is not None and
-                     prog_candidate_train_subscores is not None)
-
-    if has_train_data:
-        num_train_tasks = len(pareto_frontiers_train)
-        print(f"Found {num_candidates} candidates, {num_train_tasks} train tasks, {len(pareto_frontiers_val)} val tasks")
-    else:
-        print(f"Found {num_candidates} candidates, {len(pareto_frontiers_val)} val tasks (no train data in state)")
+    print(f"Found {num_candidates} candidates (skipped candidate 0), {num_val_tasks} val tasks")
 
     # Determine which benchmark to use
     if benchmark_name is None:
@@ -330,10 +382,11 @@ def construct_training_data(
     else:
         print(f"Using specified benchmark: {benchmark_name}")
 
-    # Load system prompts (including actual prompt text)
-    print("Loading system prompt candidates...")
+    # Load system prompts (including actual prompt text), skipping candidate 0
+    print("Loading system prompt candidates (skipping candidate 0)...")
     prog_candidates_dir = os.path.join(experiment_dir, "prog_candidates")
-    system_prompts = load_system_prompts(prog_candidates_dir, num_candidates)
+    # Pass num_candidates + 1 to account for the skipped candidate 0
+    system_prompts = load_system_prompts(prog_candidates_dir, num_candidates + 1, skip_first=True)
 
     # Check how many loaded successfully
     loaded_count = sum(1 for p in system_prompts.values() if p.get('exists', False) and 'prompt' in p)
@@ -344,45 +397,21 @@ def construct_training_data(
     output_dir = output_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create separate files for train and val
-    base_name = output_path.stem
+    # Create output file with benchmark name
     suffix = output_path.suffix
-    train_file = output_dir / f"{base_name}_train{suffix}"
-    val_file = output_dir / f"{base_name}_val{suffix}"
+    val_file = output_dir / f"{benchmark_name}_val{suffix}"
 
-    # Construct TRAINING dataset if available
-    train_data = []
-    if has_train_data:
-        print(f"\nLoading {benchmark_name} training set...")
-        trainset = load_benchmark_dspy_dataset(benchmark_name=benchmark_name, seed=seed, split="train")
-
-        train_data = construct_dataset_split(
-            split_name="train",
-            dataset=trainset,
-            pareto_frontiers=pareto_frontiers_train,
-            prog_candidate_subscores=prog_candidate_train_subscores,
-            system_prompts=system_prompts,
-            num_candidates=num_candidates
-        )
-
-        # Save training data
-        print(f"\nSaving {len(train_data)} training examples to {train_file}...")
-        with open(train_file, 'w') as f:
-            json.dump(train_data, f, indent=2)
-    else:
-        print("\nSkipping training dataset (not available in GEPA state)")
-
-    # Construct VALIDATION dataset
+    # Construct VALIDATION dataset (only using val scores)
     print(f"\nLoading {benchmark_name} validation set...")
     valset = load_benchmark_dspy_dataset(benchmark_name=benchmark_name, seed=seed, split="val")
 
     val_data = construct_dataset_split(
         split_name="val",
         dataset=valset,
-        pareto_frontiers=pareto_frontiers_val,
         prog_candidate_subscores=prog_candidate_val_subscores,
         system_prompts=system_prompts,
-        num_candidates=num_candidates
+        num_candidates=num_candidates,
+        candidate_offset=1  # We skipped candidate 0
     )
 
     # Save validation data
@@ -398,7 +427,7 @@ def construct_training_data(
     with open(metadata_file, 'w') as f:
         json.dump(metadata_only, f, indent=2)
 
-    # Compute summary statistics for TRAINING data
+    # Compute summary statistics
     def compute_stats(dataset, split_name):
         """Helper to compute statistics for a dataset split."""
         all_rewards = []
@@ -424,8 +453,7 @@ def construct_training_data(
             },
         }
 
-    # Compute statistics for both splits
-    train_stats = compute_stats(train_data, "train") if train_data else None
+    # Compute statistics for validation split
     val_stats = compute_stats(val_data, "val")
 
     summary = {
@@ -433,7 +461,6 @@ def construct_training_data(
         "benchmark_name": benchmark_name,
         "experiment_dir": experiment_dir,
         "num_unique_candidates": num_candidates,
-        "train": train_stats,
         "val": val_stats,
     }
 
@@ -442,21 +469,11 @@ def construct_training_data(
         json.dump(summary, f, indent=2)
 
     print(f"\nDataset construction complete!")
-    if train_data:
-        print(f"  Training data: {train_file}")
     print(f"  Validation data: {val_file}")
     print(f"  Candidate metadata: {metadata_file}")
     print(f"  Summary: {summary_file}")
 
     print(f"\nSummary:")
-    if train_stats:
-        print(f"\n  TRAINING SET:")
-        print(f"    Tasks: {train_stats['num_tasks']}")
-        print(f"    Avg candidates per task: {train_stats['avg_candidates_per_task']:.1f}")
-        print(f"    Total task-candidate pairs: {train_stats['total_task_candidate_pairs']}")
-        print(f"    Mean reward: {train_stats['reward_statistics']['mean']:.4f}")
-        print(f"    Positive ratio: {train_stats['reward_statistics']['positive_ratio']:.4f}")
-
     print(f"\n  VALIDATION SET:")
     print(f"    Tasks: {val_stats['num_tasks']}")
     print(f"    Avg candidates per task: {val_stats['avg_candidates_per_task']:.1f}")
@@ -472,8 +489,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--experiment_dir",
         type=str,
-        default="experiment_runs_data/experiment_runs/seed_1/hoverBench_HoverMultiHop_GEPA_Qwen3-8B",
-        help="Path to experiment directory"
+        default=None,
+        help="Path to experiment directory. If not specified, will be constructed from --benchmark_name and --seed"
     )
     parser.add_argument(
         "--output_file",
@@ -485,18 +502,23 @@ if __name__ == "__main__":
         "--seed",
         type=int,
         default=0,
-        help="Random seed for dataset shuffling"
+        help="Random seed for dataset shuffling and experiment directory selection"
     )
 
     parser.add_argument(
         "--benchmark_name",
         type=str,
-        default=None,
+        default="hoverBench",
         help="Name of the benchmark to use (e.g., 'hoverBench', 'HotpotQABench', 'IFBench'). "
-             "If not specified, will be auto-detected from experiment_dir. Defaults to 'hoverBench'."
+             "If --experiment_dir is not specified, this will be used to construct the experiment path."
     )
 
     args = parser.parse_args()
+
+    # If experiment_dir not provided, construct it from benchmark_name and seed
+    if args.experiment_dir is None:
+        args.experiment_dir = get_experiment_dir_for_benchmark(args.benchmark_name, args.seed)
+        print(f"Using auto-constructed experiment directory: {args.experiment_dir}")
 
     construct_training_data(
         experiment_dir=args.experiment_dir,

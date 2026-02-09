@@ -12,6 +12,7 @@ import random
 import os
 from pathlib import Path
 from typing import List, Dict
+from dotenv import load_dotenv
 
 from qwen_router import CandidateSelection
 
@@ -19,36 +20,10 @@ from qwen_router import CandidateSelection
 from dspy.teleprompt import GEPA
 
 
-# class RouterModule(dspy.Module):
-#     """
-#     DSPy Module wrapper for the router to be optimized by GEPA.
-#     """
-#     def __init__(self, use_reasoning: bool = False):
-#         super().__init__()
-#         if use_reasoning:
-#             self.predictor = dspy.ChainOfThought(CandidateSelectionWithReasoning)
-#         else:
-#             self.predictor = dspy.Predict(CandidateSelection)
-
-#     def forward(self, task_input: str, candidates: str):
-#         """
-#         Forward pass through the router.
-
-#         Args:
-#             task_input: The input task (e.g., claim, question)
-#             candidates: Formatted string of candidate system prompts
-
-#         Returns:
-#             Prediction with selected_candidate_idx
-#         """
-#         return self.predictor(task_input=task_input, candidates=candidates)
-
-
 def construct_training_examples(
     task_data_list: List[Dict],
     input_field: str = 'claim',
     max_candidates_display: int = 10,
-    max_prompt_length: int = 200
 ) -> List[dspy.Example]:
     """
     Convert raw training data to DSPy examples.
@@ -57,7 +32,6 @@ def construct_training_examples(
         task_data_list: List of task dictionaries with candidates and rewards
         input_field: Field name for task input (e.g., 'claim', 'question')
         max_candidates_display: Maximum candidates to show
-        max_prompt_length: Maximum length for each candidate prompt
 
     Returns:
         List of DSPy Examples
@@ -79,29 +53,7 @@ def construct_training_examples(
         best_candidate_idx = pareto_frontier[0]
 
         # Format candidates for display
-        candidates_lines = []
-        candidates_to_show = candidates[:max_candidates_display]
-
-        for candidate in candidates_to_show:
-            prompt = candidate['candidate_system_prompt']
-            if len(prompt) > max_prompt_length:
-                prompt = prompt[:max_prompt_length] + "..."
-
-            candidates_lines.append(
-                f"{candidate['candidate_idx']}.\n{prompt}"
-            )
-
-        if len(candidates) > max_candidates_display:
-            remaining_indices = [
-                str(c['candidate_idx'])
-                for c in candidates[max_candidates_display:]
-            ]
-            candidates_lines.append(
-                f"\n... and {len(candidates) - max_candidates_display} more candidates "
-                f"(indices: {', '.join(remaining_indices)})"
-            )
-
-        candidates_str = "\n".join(candidates_lines)
+        candidates_str = [f"{candidate['candidate_idx']}.\n{candidate['candidate_system_prompt']}" for idx, candidate in enumerate(candidates)]
 
         # Create DSPy example with ground truth
         example = dspy.Example(
@@ -259,7 +211,7 @@ def main():
     parser.add_argument(
         '--training_data',
         type=str,
-        default='router/training_data.json',
+        default='router/hoverBench_val.json',
         help='Path to training data JSON'
     )
     parser.add_argument(
@@ -297,7 +249,7 @@ def main():
     parser.add_argument(
         '--model',
         type=str,
-        default='openai/Qwen/Qwen3-4B-Instruct-2507',
+        default='openai/Qwen/Qwen3-30B-A3B-Instruct-2507',
         help='Model name for DSPy (student LM for inference)'
     )
     parser.add_argument(
@@ -341,12 +293,6 @@ def main():
         default=30,
         help='Maximum candidates to show in prompt'
     )
-    parser.add_argument(
-        '--max_prompt_length',
-        type=int,
-        default=32000,
-        help='Maximum length for each candidate prompt'
-    )
 
     # Output arguments
     parser.add_argument(
@@ -366,6 +312,14 @@ def main():
 
     # Set seed
     random.seed(args.seed)
+
+    # Load environment variables from .env file
+    env_path = Path(__file__).parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+        print(f"✓ Loaded environment variables from {env_path}")
+    else:
+        print(f"⚠ No .env file found at {env_path}, using system environment variables")
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -387,18 +341,18 @@ def main():
     if "gpt" in args.model.lower():
         if not api_key:
             raise ValueError("OPENAI_API_KEY not found")
-        lm = dspy.LM(args.model, api_key=api_key, temperature=1.0, max_tokens=32000)
+        lm = dspy.LM(args.model, api_key=api_key, temperature=1.0)
     else:
-        lm = dspy.LM(args.model, api_base="http://localhost:8000/v1", api_key="api_key", temperature=1.0, max_tokens=32000)
+        lm = dspy.LM(args.model, api_base="http://localhost:8000/v1", api_key="api_key", temperature=1.0)
 
     # Reflection LM (for GEPA meta-cognitive analysis)
     print(f"  Reflection LM: {args.reflection_model}")
     if "gpt" in args.reflection_model.lower():
         if not api_key:
             raise ValueError("OPENAI_API_KEY not found for reflection model")
-        reflection_lm = dspy.LM(args.reflection_model, api_key=api_key, temperature=1.0, max_tokens=32000, cache=True)
+        reflection_lm = dspy.LM(args.reflection_model, api_key=api_key, temperature=1.0, cache=True)
     else:
-        reflection_lm = dspy.LM(args.reflection_model, api_base="http://localhost:8000/v1", api_key="api_key", temperature=1.0, max_tokens=32000)
+        reflection_lm = dspy.LM(args.reflection_model, api_base="http://localhost:8000/v1", api_key="api_key", temperature=1.0)
 
     dspy.configure(lm=lm)
     print(f"✓ Configured DSPy with student LM: {args.model}")
@@ -453,15 +407,14 @@ def main():
         train_data,
         input_field=input_field,
         max_candidates_display=args.max_candidates_display,
-        max_prompt_length=args.max_prompt_length
     )
 
     val_examples = construct_training_examples(
         val_data,
         input_field=input_field,
         max_candidates_display=args.max_candidates_display,
-        max_prompt_length=args.max_prompt_length
     )
+
 
     print(f"Created {len(train_examples)} train examples, {len(val_examples)} val examples")
 
@@ -486,6 +439,7 @@ def main():
         'add_format_failure_as_feedback': True,
         'use_wandb': True,
         "wandb_api_key": wandb_key,
+        "log_dir": run_dir,
     }
 
     # Add budget control (either auto or manual)
@@ -496,6 +450,8 @@ def main():
         gepa_config['auto'] = args.auto
         print(f"Using auto configuration: {args.auto}")
 
+    print(f"GEPA config: {gepa_config}")
+    # import pdb; pdb.set_trace()
     gepa_optimizer = GEPA(**gepa_config)
 
     print("✓ GEPA optimizer initialized")
@@ -582,8 +538,8 @@ def main():
             print("(Instructions not available)")
 
         # Save optimized router
-        optimized_router.save(os.path.join(run_dir, "optimized_router"))
-        print(f"\n✓ Saved optimized router to {run_dir}/optimized_router")
+        optimized_router.save(os.path.join(run_dir, "optimized_router.pkl"))
+        print(f"\n✓ Saved optimized router to {run_dir}/optimized_router.pkl")
 
         # Save configuration and results
         config = {

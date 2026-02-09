@@ -18,19 +18,10 @@ class CandidateSelection(dspy.Signature):
     """
 
     task_input = dspy.InputField(desc="The input task (e.g., question, claim, problem)")
-    candidates = dspy.InputField(desc="List of candidate system prompts")
+    candidates: List[str] = dspy.InputField(desc="List of candidate system prompts")
     selected_candidate_idx = dspy.OutputField(desc="The index of the best candidate (just the number)")
 
 
-class CandidateSelectionWithReasoning(dspy.Signature):
-    """
-    Given a task and multiple candidate system prompts, reason about and select the best one.
-    """
-
-    task_input = dspy.InputField(desc="The input task (e.g., question, claim, problem)")
-    candidates = dspy.InputField(desc="List of candidate system prompts")
-    reasoning = dspy.OutputField(desc="Step-by-step reasoning about which candidate is best")
-    selected_candidate_idx = dspy.OutputField(desc="The index of the best candidate (just the number)")
 
 
 class QwenRouter(Router):
@@ -59,28 +50,11 @@ class QwenRouter(Router):
         assert lm is not None, "LM must be provided"
 
         self.lm = lm
-        self.use_reasoning = use_reasoning
 
         # Initialize the DSPy module
-        if use_reasoning:
-            self.predictor = dspy.ChainOfThought(CandidateSelectionWithReasoning)
-        else:
-            self.predictor = dspy.Predict(CandidateSelection)
+        self.predictor = dspy.Predict(CandidateSelection)
 
         self.predictor.set_lm(lm)
-
-    # def _format_candidates(self, candidates: List[Dict]) -> List[str]:
-    #     """
-    #     Format candidates into a list for the LM.
-
-    #     Args:
-    #         candidates: List of candidate dicts
-
-    #     Returns:
-    #         List of candidate system prompts
-    #     """
-    #     # Return list of system prompts
-    #     return '\n'.join([f"{idx}.\n{candidate['candidate_system_prompt']}" for idx, candidate in enumerate(candidates)])
         
 
     def _parse_selection(self, output: str, candidates: List[Dict]) -> int:
@@ -141,7 +115,7 @@ class QwenRouter(Router):
             raise ValueError("Cannot select from empty candidate list")
 
         # Format candidates for the LM
-        candidates_str = '\n'.join([f"{idx}.\n{candidate['candidate_system_prompt']}" for idx, candidate in enumerate(candidates)])
+        candidates_str = [f"{idx}.\n{candidate['candidate_system_prompt']}" for idx, candidate in enumerate(candidates)]
 
         # Call the LM - wrap synchronous DSPy call to make it non-blocking
         try:

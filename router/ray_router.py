@@ -7,14 +7,17 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 
 llm_config1 = LLMConfig(
     model_loading_config=dict(
-        model_id="Qwen/Qwen3-8B",
-        model_source="Qwen/Qwen3-8B",
+        model_id="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        model_source="Qwen/Qwen3-30B-A3B-Instruct-2507",
     ),
     deployment_config=dict(
         autoscaling_config=dict(
-            min_replicas=4, max_replicas=4,
+            min_replicas=2, max_replicas=2,
         )
     ),
+    engine_kwargs={
+        "tensor_parallel_size": 2,
+    },
     accelerator_type="A100",
 )
 
